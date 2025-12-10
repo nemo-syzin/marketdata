@@ -14,7 +14,7 @@ from playwright.async_api import (
 # ================== НАСТРОЙКИ =======================================
 
 RAPIRA_TRADE_URL = "https://rapira.net/trading/usdt-rub"  # URL пары
-POLL_INTERVAL_SEC = 10                                    # период опроса
+POLL_INTERVAL_SEC = 10                                    # период опроса в секундах
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,14 +22,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("marketdata-rapira")
 
-_last_trade_key: Optional[str] = None  # маркер последней сделки
+# маркер последней сделки, чтобы отсекать дубли
+_last_trade_key: Optional[str] = None
 
 
 # ================== УСТАНОВКА PLAYWRIGHT BROWSER ====================
 
 def install_chromium() -> None:
     """
-    Качаем Chromium для Playwright (как в рабочем проекте kenigswap-rates).
+    Качаем Chromium для Playwright (как в kenigswap-rates).
+    Если уже установлен — просто пройдёт без ошибки.
     """
     try:
         log.info("Installing Chromium for Playwright ...")
@@ -47,7 +49,7 @@ class RapiraDomTrade:
     volume: float
     time_str: str   # строка времени, напр. "16:25:10"
     ts: datetime    # datetime по сегодняшней дате
-    side: Optional[str] = None  # BUY/SELL, если захочешь добавить позже
+    side: Optional[str] = None  # BUY/SELL, если захочешь использовать
 
 
 # ================== HELPERS =========================================
@@ -70,7 +72,7 @@ def _parse_number_ru(s: str) -> Optional[float]:
 
 def _build_trade_key(t: RapiraDomTrade) -> str:
     """
-    Стабильный ключ для сделки — для отсечения дублей.
+    Ключ для сделки — для отсечения дублей.
     """
     return f"{t.time_str}|{t.price}|{t.volume}"
 
@@ -95,10 +97,45 @@ def _combine_time_today(time_str: str) -> datetime:
 
 # ================== ПОДГОТОВКА СТРАНИЦЫ =============================
 
+async def _try_click_history(page: Page) -> None:
+    """
+    Пытаемся активировать вкладку 'История сделок' несколькими способами.
+    Ошибки не пробрасываем — просто логируем и идём дальше.
+    """
+    # 1) по роли вкладки
+    try:
+        await page.get_by_role("tab", name="История сделок").click(timeout=5000)
+        log.info("Clicked tab by role(name='История сделок').")
+        return
+    except PlaywrightTimeoutError:
+        pass
+
+    # 2) по точному тексту
+    for txt in ("История сделок", "История"):
+        try:
+            await page.get_by_text(txt, exact=False).click(timeout=5000)
+            log.info("Clicked tab by text '%s'.", txt)
+            return
+        except PlaywrightTimeoutError:
+            continue
+
+    # 3) CSS-локатор по data-state / id (если повезёт)
+    try:
+        # кнопка, которая управляет rp-5-0-content-history
+        await page.locator("[aria-controls='rp-5-0-content-history']").click(timeout=5000)
+        log.info("Clicked tab via [aria-controls='rp-5-0-content-history'].")
+        return
+    except PlaywrightTimeoutError:
+        pass
+
+    log.info("Failed to click 'История' tab explicitly, maybe it's already active.")
+
+
 async def _prepare_page():
     """
-    Запускаем браузер, открываем страницу, переключаемся на вкладку 'История'
-    и ждём появления строк истории сделок (tbody tr.table-orders-row).
+    Запускаем браузер, открываем страницу, принимаем cookies, пытаемся
+    включить вкладку 'История', даём странице время подгрузиться.
+    Никаких wait_for_selector, чтобы не падать по timeout.
     """
     p = await async_playwright().start()
     browser = await p.chromium.launch(
@@ -108,59 +145,68 @@ async def _prepare_page():
     page = await browser.new_page(viewport={"width": 1280, "height": 720})
 
     log.info("Opening Rapira page %s ...", RAPIRA_TRADE_URL)
-    # domcontentloaded — чтобы не ждать бесконечные веб-сокеты
     await page.goto(RAPIRA_TRADE_URL, wait_until="domcontentloaded")
 
     # принять cookies, если есть
     try:
-        await page.get_by_text("Я согласен").click(timeout=5000)
+        await page.get_by_text("Я согласен", exact=False).click(timeout=5000)
+        log.info("Accepted cookies.")
     except PlaywrightTimeoutError:
-        pass
+        log.info("No 'Я согласен' button (cookies) or not clickable.")
 
-    # вкладка "История" (на всякий случай)
+    # вкладка "История"
+    await _try_click_history(page)
+
+    # просто ждём несколько секунд, чтобы JS подтянул таблицы
+    log.info("Waiting a bit for page JS to load data ...")
+    await page.wait_for_timeout(5000)
+
     try:
-        await page.get_by_text("История").click(timeout=10000)
-    except PlaywrightTimeoutError:
-        log.info("Tab 'История' might already be active")
-
-    # Ждём ПРЯМО строки истории, без привязки к id
-    # это те самые <tr class="table-orders-row border-0 fs-7 lh-1">...
-    log.info("Waiting for history rows (tbody tr.table-orders-row) ...")
-    await page.wait_for_selector("tbody tr.table-orders-row", timeout=30000)
-    log.info("History rows are present, page is ready.")
-
-    # небольшая пауза, чтобы DOM устаканился
-    await page.wait_for_timeout(1000)
+        title = await page.title()
+        log.info("Page title: %s", title)
+    except Exception:
+        pass
 
     return p, browser, page
 
 
-# ================== ПАРСИНГ КОНКРЕТНОЙ ТАБЛИЦЫ =====================
+# ================== ПАРСИНГ ТАБЛИЦЫ ================================
 
 async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
     """
     Парсим таблицу истории сделок.
-    Ищем таблицу, у которой есть строки tr.table-orders-row, и вытаскиваем
-    первые три ячейки: цена, объём, время.
+    Ищем таблицу внутри div.table-responsive.table-orders и там вытаскиваем
+    строки tbody tr.table-orders-row.
+    Если строк нет — просто возвращаем [].
     """
-    # самая «узкая» привязка к таблице истории
-    table = page.locator("div.table-responsive.table-orders table").first
+    tables = page.locator("div.table-responsive.table-orders table")
+    count_tables = await tables.count()
+    if count_tables == 0:
+        log.info("No div.table-responsive.table-orders table found yet.")
+        return []
 
-    # заголовки — просто для логов
+    table = tables.first
+
+    # заголовки просто для информации
     try:
-        headers = await table.locator("thead tr").first.locator("th").all_inner_texts()
-        headers = [h.strip() for h in headers if h.strip()]
+        header_cells = table.locator("thead tr").first.locator("th")
+        header_count = await header_cells.count()
+        headers = []
+        for i in range(header_count):
+            txt = (await header_cells.nth(i).inner_text()).strip()
+            if txt:
+                headers.append(txt)
         if headers:
-            log.info("History table headers: %s", " | ".join(headers))
-        else:
-            log.info("History table: no thead headers detected")
+            log.info("History-like table headers: %s", " | ".join(headers))
     except PlaywrightTimeoutError:
-        log.info("History table: no thead found")
+        log.info("Table has no thead (or header not found).")
 
-    # строки сделок
     rows = table.locator("tbody tr.table-orders-row")
     row_count = await rows.count()
-    log.info("History table rows: %d", row_count)
+    log.info("table-orders-row count: %d", row_count)
+
+    if row_count == 0:
+        return []
 
     trades: List[RapiraDomTrade] = []
 
@@ -190,7 +236,7 @@ async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
 
         ts = _combine_time_today(time_text)
 
-        # можно вытащить side по классу (text-danger / text-success), если нужно
+        # side по цвету строки (если нужен)
         row_classes = (await row.get_attribute("class") or "").lower()
         side = None
         if "text-danger" in row_classes:
@@ -198,14 +244,15 @@ async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
         elif "text-success" in row_classes:
             side = "BUY"
 
-        trade = RapiraDomTrade(
-            price=price,
-            volume=volume,
-            time_str=time_text,
-            ts=ts,
-            side=side,
+        trades.append(
+            RapiraDomTrade(
+                price=price,
+                volume=volume,
+                time_str=time_text,
+                ts=ts,
+                side=side,
+            )
         )
-        trades.append(trade)
 
     trades.sort(key=lambda t: t.ts)
     return trades
@@ -214,13 +261,14 @@ async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
 async def fetch_rapira_new_trades(page: Page) -> List[RapiraDomTrade]:
     """
     Возвращает только новые сделки по сравнению с предыдущим вызовом.
+    Никаких исключений наружу не кидает.
     """
     global _last_trade_key
 
     try:
         trades = await _parse_trades_from_page(page)
-    except PlaywrightTimeoutError as e:
-        log.warning("parse error: %s", e)
+    except Exception as e:
+        log.warning("Error while parsing trades: %s", e)
         return []
 
     if not trades:
@@ -259,7 +307,7 @@ async def main():
             if new_trades:
                 total_turnover = sum(t.price * t.volume for t in new_trades)
                 log.info(
-                    "New trades: %d, total turnover: %.2f RUB",
+                    "New trades: %d, total turnover: %.2f (price*volume sum)",
                     len(new_trades),
                     total_turnover,
                 )
@@ -271,7 +319,9 @@ async def main():
                         t.volume,
                         t.side or "-",
                     )
-                # тут потом добавим запись в БД / Supabase
+                # здесь потом добавим запись в БД / Supabase
+            else:
+                log.info("No trades parsed this cycle, will retry.")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -286,3 +336,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
