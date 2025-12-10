@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from playwright.async_api import async_playwright, Page
 
-RAPIRA_URL = "https://rapira.net/trading/usdt-rub"
+RAPIRA_URL = "https://rapira.net/exchange/USDT_RUB"
 
 logging.basicConfig(
     level=logging.INFO,
