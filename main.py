@@ -97,7 +97,8 @@ def _combine_time_today(time_str: str) -> datetime:
 
 async def _prepare_page():
     """
-    Запускаем браузер, открываем страницу, переключаемся на вкладку 'История'.
+    Запускаем браузер, открываем страницу, переключаемся на вкладку 'История'
+    и ждём появления строк истории сделок (tbody tr.table-orders-row).
     """
     p = await async_playwright().start()
     browser = await p.chromium.launch(
@@ -107,9 +108,10 @@ async def _prepare_page():
     page = await browser.new_page(viewport={"width": 1280, "height": 720})
 
     log.info("Opening Rapira page %s ...", RAPIRA_TRADE_URL)
-    await page.goto(RAPIRA_TRADE_URL, wait_until="networkidle")
+    # domcontentloaded — чтобы не ждать бесконечные веб-сокеты
+    await page.goto(RAPIRA_TRADE_URL, wait_until="domcontentloaded")
 
-    # принять cookies
+    # принять cookies, если есть
     try:
         await page.get_by_text("Я согласен").click(timeout=5000)
     except PlaywrightTimeoutError:
@@ -121,8 +123,13 @@ async def _prepare_page():
     except PlaywrightTimeoutError:
         log.info("Tab 'История' might already be active")
 
-    # ждём, пока контейнер истории появится
-    await page.wait_for_selector("#rp-5-0-content-history", state="visible", timeout=15000)
+    # Ждём ПРЯМО строки истории, без привязки к id
+    # это те самые <tr class="table-orders-row border-0 fs-7 lh-1">...
+    log.info("Waiting for history rows (tbody tr.table-orders-row) ...")
+    await page.wait_for_selector("tbody tr.table-orders-row", timeout=30000)
+    log.info("History rows are present, page is ready.")
+
+    # небольшая пауза, чтобы DOM устаканился
     await page.wait_for_timeout(1000)
 
     return p, browser, page
@@ -132,21 +139,23 @@ async def _prepare_page():
 
 async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
     """
-    Парсим таблицу истории сделок внутри #rp-5-0-content-history.
-    Берём строки <tr class="table-orders-row ..."> и достаем
-    цену, объём и время (первые три <td>).
+    Парсим таблицу истории сделок.
+    Ищем таблицу, у которой есть строки tr.table-orders-row, и вытаскиваем
+    первые три ячейки: цена, объём, время.
     """
-    # контейнер истории
-    history = page.locator("#rp-5-0-content-history")
-    await history.wait_for(state="visible", timeout=15000)
-
-    # table внутри блока истории (та, что видно на скриншоте)
-    table = history.locator("div.table-responsive.table-orders table").first
+    # самая «узкая» привязка к таблице истории
+    table = page.locator("div.table-responsive.table-orders table").first
 
     # заголовки — просто для логов
-    headers = await table.locator("thead tr").first.locator("th").all_inner_texts()
-    headers = [h.strip() for h in headers if h.strip()]
-    log.info("History table headers: %s", " | ".join(headers) if headers else "<no thead>")
+    try:
+        headers = await table.locator("thead tr").first.locator("th").all_inner_texts()
+        headers = [h.strip() for h in headers if h.strip()]
+        if headers:
+            log.info("History table headers: %s", " | ".join(headers))
+        else:
+            log.info("History table: no thead headers detected")
+    except PlaywrightTimeoutError:
+        log.info("History table: no thead found")
 
     # строки сделок
     rows = table.locator("tbody tr.table-orders-row")
@@ -262,7 +271,7 @@ async def main():
                         t.volume,
                         t.side or "-",
                     )
-                # здесь можно вместо логов писать в БД / Supabase и т.п.
+                # тут потом добавим запись в БД / Supabase
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
