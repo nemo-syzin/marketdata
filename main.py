@@ -94,7 +94,6 @@ async def ensure_last_trades_tab(page: Page) -> None:
             if await tab.count() > 0:
                 logging.info("Clicking tab '%s' ...", text)
                 await tab.first.click(timeout=5_000)
-                # Небольшая пауза после переключения
                 await page.wait_for_timeout(1_000)
                 return
         except Exception as e:
@@ -112,12 +111,14 @@ async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[An
 
     По твоему скрину структура такая:
       <div class="table-responsive table-orders ...">
-        <table>
+        <table class="table-row-dashed ...">
           <tbody>
             <tr class="table-orders-row ...">
     """
 
     selectors = [
+        "div.table-responsive.table-orders table.table-row-dashed tbody tr.table-orders-row",
+        "div.table-responsive.table-orders table.table-row-dashed tbody tr",
         "div.table-responsive.table-orders table tbody tr.table-orders-row",
         "div.table-responsive.table-orders table tbody tr",
         "table.table-row-dashed tbody tr.table-orders-row",
@@ -159,20 +160,54 @@ def _normalize_num(text: str) -> float:
 
 
 async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Разбираем строки таблицы сделок.
+
+    На некоторых биржах первая ячейка может быть <th>, а не <td>,
+    поэтому берём и th, и td.
+    """
     trades: List[Dict[str, Any]] = []
 
-    for row in rows:
+    for idx, row in enumerate(rows):
         try:
-            cells = await row.query_selector_all("td")
+            # Берём и <th>, и <td>
+            cells = await row.query_selector_all("th, td")
             if len(cells) < 3:
+                logging.info(
+                    "Row %d skipped: has only %d cells (need >= 3).",
+                    idx,
+                    len(cells),
+                )
                 continue
 
             price_text = (await cells[0].inner_text()).strip()
             volume_text = (await cells[1].inner_text()).strip()
             time_text = (await cells[2].inner_text()).strip()
 
-            price = _normalize_num(price_text)
-            volume = _normalize_num(volume_text)
+            # Пропускаем пустые и строку-заголовок типа 'Цена / Объём / Время'
+            if not price_text or not volume_text or not time_text:
+                logging.info(
+                    "Row %d skipped: empty cell(s): price='%s', volume='%s', time='%s'",
+                    idx,
+                    price_text,
+                    volume_text,
+                    time_text,
+                )
+                continue
+
+            try:
+                price = _normalize_num(price_text)
+                volume = _normalize_num(volume_text)
+            except Exception as conv_err:
+                logging.info(
+                    "Row %d skipped: cannot convert to float "
+                    "(price='%s', volume='%s'): %s",
+                    idx,
+                    price_text,
+                    volume_text,
+                    conv_err,
+                )
+                continue
 
             trades.append(
                 {
@@ -184,7 +219,7 @@ async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
                 }
             )
         except Exception as e:
-            logging.info("Failed to parse a trade row: %s", e)
+            logging.info("Failed to parse a trade row %d: %s", idx, e)
             continue
 
     return trades
