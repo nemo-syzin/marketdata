@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import subprocess
 from typing import Any, Dict, List
 
 from playwright.async_api import async_playwright, Page
@@ -13,6 +14,46 @@ logging.basicConfig(
 )
 
 
+# ───────────────────────── УСТАНОВКА BROWSERS ─────────────────────────
+
+
+def ensure_playwright_browsers() -> None:
+    """
+    Гарантируем, что нужные браузеры для Playwright скачаны.
+
+    ВАЖНО:
+    - только download (без системных deps)
+    - никаких su / --with-deps
+    """
+    try:
+        logging.info("Ensuring Playwright Chromium is installed ...")
+        result = subprocess.run(
+            ["playwright", "install", "chromium", "chromium-headless-shell"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            logging.info("Playwright Chromium is installed (or already present).")
+        else:
+            logging.error(
+                "playwright install returned code %s\nSTDOUT:\n%s\nSTDERR:\n%s",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
+    except FileNotFoundError:
+        logging.error(
+            "playwright CLI not found in PATH. "
+            "Убедись, что Playwright установлен (npm/pip) и доступен как 'playwright'."
+        )
+    except Exception as e:
+        logging.error("Unexpected error while installing Playwright browsers: %s", e)
+
+
+# ───────────────────────── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ─────────────────────────
+
+
 async def close_silently(page: Page) -> None:
     try:
         await page.close()
@@ -22,8 +63,7 @@ async def close_silently(page: Page) -> None:
 
 async def accept_cookies_if_any(page: Page) -> None:
     """
-    На Rapira иногда показывается баннер cookies с кнопкой «Я согласен».
-    Если он есть — нажимаем и игнорируем все ошибки.
+    Нажимаем 'Я согласен' на баннере cookies, если он есть.
     """
     try:
         btn = page.locator("text=Я согласен")
@@ -36,36 +76,47 @@ async def accept_cookies_if_any(page: Page) -> None:
         logging.info("Ignoring cookies click error: %s", e)
 
 
-async def ensure_history_tab(page: Page) -> None:
+async def ensure_last_trades_tab(page: Page) -> None:
     """
-    В центральном блоке есть вкладки Книга / История.
-    Пробуем кликнуть по «История», но если элемент не найден —
-    ничего страшного: нам подойдёт и правая колонка «Последние сделки».
+    Включаем вкладку 'Последние сделки' в центральном блоке.
+
+    На всякий случай пробуем несколько вариантов текста.
     """
-    try:
-        history_tab = page.locator("text=История")
-        if await history_tab.count() > 0:
-            logging.info("Clicking 'История' tab...")
-            await history_tab.first.click(timeout=5_000)
-        else:
-            logging.info("History tab element not found explicitly, maybe already active.")
-    except Exception as e:
-        logging.info("Failed to click 'История' tab explicitly, maybe it's already active: %s", e)
+    candidates = [
+        "Последние сделки",
+        "История сделок",
+        "История",
+    ]
+
+    for text in candidates:
+        try:
+            tab = page.locator(f"text={text}")
+            if await tab.count() > 0:
+                logging.info("Clicking tab '%s' ...", text)
+                await tab.first.click(timeout=5_000)
+                # Небольшая пауза после переключения
+                await page.wait_for_timeout(1_000)
+                return
+        except Exception as e:
+            logging.info("Failed to click tab '%s': %s", text, e)
+
+    logging.info(
+        "Last-trades tab ('Последние сделки' / 'История сделок') "
+        "not found explicitly, возможно, уже активна."
+    )
 
 
 async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[Any]:
     """
-    Периодически пытается найти строки сделок в DOM.
+    Ожидаем появления строк сделок в DOM.
 
-    Структура по скрину:
+    По твоему скрину структура такая:
       <div class="table-responsive table-orders ...">
-        <table class="table table-row-dashed ...">
+        <table>
           <tbody>
             <tr class="table-orders-row ...">
-              <td>Цена</td>
-              <td>Объём</td>
-              <td>Время</td>
     """
+
     selectors = [
         "div.table-responsive.table-orders table tbody tr.table-orders-row",
         "div.table-responsive.table-orders table tbody tr",
@@ -74,8 +125,7 @@ async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[An
         "tr.table-orders-row",
     ]
 
-    attempts = max_wait_seconds
-    for i in range(attempts):
+    for i in range(max_wait_seconds):
         for selector in selectors:
             rows = await page.query_selector_all(selector)
             if rows:
@@ -84,14 +134,14 @@ async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[An
                     len(rows),
                     selector,
                     i + 1,
-                    attempts,
+                    max_wait_seconds,
                 )
                 return rows
 
         logging.info(
             "No trade rows found yet (attempt %d/%d), waiting 1 second...",
             i + 1,
-            attempts,
+            max_wait_seconds,
         )
         await page.wait_for_timeout(1_000)
 
@@ -101,8 +151,7 @@ async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[An
 
 def _normalize_num(text: str) -> float:
     """
-    Преобразует строку вида '191 889.47' или '78,12' в float.
-    Если не получилось — выбрасывает ValueError.
+    Преобразует '191 889.47' / '191 889,47' / '78,12' -> float.
     """
     t = text.replace("\xa0", " ").replace(" ", "")
     t = t.replace(",", ".")
@@ -141,7 +190,14 @@ async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
     return trades
 
 
+# ───────────────────────── ОСНОВНОЙ СКРАПЕР ─────────────────────────
+
+
 async def scrape_rapira_trades() -> Dict[str, Any]:
+    # 1. Сначала гарантируем, что браузеры скачаны
+    ensure_playwright_browsers()
+
+    # 2. Запускаем Playwright
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -169,16 +225,16 @@ async def scrape_rapira_trades() -> Dict[str, Any]:
             logging.info("Opening Rapira page %s ...", RAPIRA_URL)
             await page.goto(RAPIRA_URL, wait_until="networkidle", timeout=60_000)
 
-            # Подождём, пока фронт подтянет данные
+            # Даём фронту немного времени подтянуть данные
             await page.wait_for_timeout(5_000)
 
             await accept_cookies_if_any(page)
-            await ensure_history_tab(page)
+            await ensure_last_trades_tab(page)
 
-            # Ещё пауза после переключения вкладки
+            # Ещё пауза после переключения
             await page.wait_for_timeout(3_000)
 
-            logging.info("Trying to detect history/last-trades table in DOM ...")
+            logging.info("Trying to detect last-trades table in DOM ...")
             rows = await poll_for_trade_rows(page, max_wait_seconds=40)
 
             if not rows:
@@ -191,7 +247,6 @@ async def scrape_rapira_trades() -> Dict[str, Any]:
                 }
 
             trades = await parse_trades_from_rows(rows)
-
             logging.info("Parsed %d trades.", len(trades))
 
             return {
@@ -204,6 +259,9 @@ async def scrape_rapira_trades() -> Dict[str, Any]:
             await close_silently(page)
             await context.close()
             await browser.close()
+
+
+# ───────────────────────── entrypoint ─────────────────────────
 
 
 async def main() -> None:
