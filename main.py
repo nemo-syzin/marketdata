@@ -5,15 +5,16 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 from typing import List, Optional
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page, Locator
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    Page,
+)
 
-# ============= НАСТРОЙКИ ============================================
+# ================== НАСТРОЙКИ =======================================
 
-# Страница Rapira с парой USDT/RUB (поменяй при необходимости)
-RAPIRA_TRADE_URL = "https://rapira.net/trading/usdt-rub"
-
-# Как часто опрашивать таблицу "История", секунды
-POLL_INTERVAL_SEC = 10
+RAPIRA_TRADE_URL = "https://rapira.net/trading/usdt-rub"  # URL пары
+POLL_INTERVAL_SEC = 10                                    # период опроса
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,15 +22,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("marketdata-rapira")
 
-# Маркер последней обработанной сделки (в рамках процесса)
-_last_trade_key: Optional[str] = None
+_last_trade_key: Optional[str] = None  # маркер последней сделки
 
 
-# ============= УСТАНОВКА PLAYWRIGHT BROWSER ==========================
+# ================== УСТАНОВКА PLAYWRIGHT BROWSER ====================
 
 def install_chromium() -> None:
     """
-    Скачивает Chromium для Playwright (как в kenigswap-rates).
+    Качаем Chromium для Playwright (как в рабочем проекте kenigswap-rates).
     """
     try:
         log.info("Installing Chromium for Playwright ...")
@@ -39,18 +39,18 @@ def install_chromium() -> None:
         log.warning("Playwright install error (ignored): %s", exc)
 
 
-# ============= МОДЕЛЬ ДАННЫХ =======================================
+# ================== МОДЕЛЬ ДАННЫХ ===================================
 
 @dataclass
 class RapiraDomTrade:
     price: float
     volume: float
-    time_str: str          # строка, как в таблице, напр. "15:17:49"
-    ts: datetime           # время сделки (UTC, по сегодняшней дате)
-    side: Optional[str] = None
+    time_str: str   # строка времени, напр. "16:25:10"
+    ts: datetime    # datetime по сегодняшней дате
+    side: Optional[str] = None  # BUY/SELL, если захочешь добавить позже
 
 
-# ============= HELPERS =============================================
+# ================== HELPERS =========================================
 
 def _parse_number_ru(s: str) -> Optional[float]:
     """
@@ -70,7 +70,7 @@ def _parse_number_ru(s: str) -> Optional[float]:
 
 def _build_trade_key(t: RapiraDomTrade) -> str:
     """
-    Стабильный ключ сделки для дедупликации.
+    Стабильный ключ для сделки — для отсечения дублей.
     """
     return f"{t.time_str}|{t.price}|{t.volume}"
 
@@ -93,64 +93,18 @@ def _combine_time_today(time_str: str) -> datetime:
         return datetime.now(timezone.utc)
 
 
-# ============= ПОИСК ТАБЛИЦЫ "ИСТОРИЯ" ==============================
-
-async def _find_history_table(page: Page) -> Locator:
-    """
-    Ищет на странице таблицу, в заголовке которой есть колонки
-    'Цена', 'Объем/Объём', 'Время' (или 'Price', 'Volume', 'Time').
-
-    Возвращает Locator на эту таблицу или бросает TimeoutError.
-    """
-    # даём странице чуть времени дорендериться
-    await page.wait_for_timeout(2000)
-
-    tables = page.locator("table")
-    count = await tables.count()
-    log.info("Found %d <table> elements on page", count)
-
-    for i in range(count):
-        t = tables.nth(i)
-        # пытаемся считать заголовки thead
-        headers = await t.locator("thead th").all_inner_texts()
-        headers = [h.strip() for h in headers if h.strip()]
-        if len(headers) < 3:
-            continue
-
-        headers_joined = " | ".join(headers)
-        log.debug("Table %d headers: %s", i, headers_joined)
-
-        has_price = any("цен" in h.lower() or "price" in h.lower() for h in headers)
-        has_vol = any(
-            "объем" in h.lower()
-            or "объём" in h.lower()
-            or "volume" in h.lower()
-            for h in headers
-        )
-        has_time = any("врем" in h.lower() or "time" in h.lower() for h in headers)
-
-        if has_price and has_vol and has_time:
-            log.info("History table detected at index %d", i)
-            return t
-
-    # если ни одна таблица не подошла
-    raise PlaywrightTimeoutError("History trades table not found by headers")
-
-
-# ============= PLAYWRIGHT / DOM-ПАРСИНГ ============================
+# ================== ПОДГОТОВКА СТРАНИЦЫ =============================
 
 async def _prepare_page():
     """
-    Запускаем браузер, открываем страницу и включаем вкладку 'История'.
+    Запускаем браузер, открываем страницу, переключаемся на вкладку 'История'.
     """
     p = await async_playwright().start()
     browser = await p.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
-    page = await browser.new_page(
-        viewport={"width": 1280, "height": 720},
-    )
+    page = await browser.new_page(viewport={"width": 1280, "height": 720})
 
     log.info("Opening Rapira page %s ...", RAPIRA_TRADE_URL)
     await page.goto(RAPIRA_TRADE_URL, wait_until="networkidle")
@@ -161,27 +115,45 @@ async def _prepare_page():
     except PlaywrightTimeoutError:
         pass
 
-    # перейти на вкладку 'История'
+    # вкладка "История" (на всякий случай)
     try:
         await page.get_by_text("История").click(timeout=10000)
     except PlaywrightTimeoutError:
         log.info("Tab 'История' might already be active")
 
-    await page.wait_for_timeout(1500)
+    # ждём, пока контейнер истории появится
+    await page.wait_for_selector("#rp-5-0-content-history", state="visible", timeout=15000)
+    await page.wait_for_timeout(1000)
+
     return p, browser, page
 
 
+# ================== ПАРСИНГ КОНКРЕТНОЙ ТАБЛИЦЫ =====================
+
 async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
     """
-    Находит таблицу 'История' и парсит из неё сделки.
+    Парсим таблицу истории сделок внутри #rp-5-0-content-history.
+    Берём строки <tr class="table-orders-row ..."> и достаем
+    цену, объём и время (первые три <td>).
     """
-    table = await _find_history_table(page)
+    # контейнер истории
+    history = page.locator("#rp-5-0-content-history")
+    await history.wait_for(state="visible", timeout=15000)
 
-    rows = table.locator("tbody tr")
+    # table внутри блока истории (та, что видно на скриншоте)
+    table = history.locator("div.table-responsive.table-orders table").first
+
+    # заголовки — просто для логов
+    headers = await table.locator("thead tr").first.locator("th").all_inner_texts()
+    headers = [h.strip() for h in headers if h.strip()]
+    log.info("History table headers: %s", " | ".join(headers) if headers else "<no thead>")
+
+    # строки сделок
+    rows = table.locator("tbody tr.table-orders-row")
     row_count = await rows.count()
-    trades: List[RapiraDomTrade] = []
-
     log.info("History table rows: %d", row_count)
+
+    trades: List[RapiraDomTrade] = []
 
     for i in range(row_count):
         row = rows.nth(i)
@@ -194,6 +166,14 @@ async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
         vol_text = (await cells.nth(1).inner_text()).strip()
         time_text = (await cells.nth(2).inner_text()).strip()
 
+        if i == 0:
+            log.info(
+                "First row raw: price='%s', volume='%s', time='%s'",
+                price_text,
+                vol_text,
+                time_text,
+            )
+
         price = _parse_number_ru(price_text)
         volume = _parse_number_ru(vol_text)
         if price is None or volume is None:
@@ -201,12 +181,20 @@ async def _parse_trades_from_page(page: Page) -> List[RapiraDomTrade]:
 
         ts = _combine_time_today(time_text)
 
+        # можно вытащить side по классу (text-danger / text-success), если нужно
+        row_classes = (await row.get_attribute("class") or "").lower()
+        side = None
+        if "text-danger" in row_classes:
+            side = "SELL"
+        elif "text-success" in row_classes:
+            side = "BUY"
+
         trade = RapiraDomTrade(
             price=price,
             volume=volume,
             time_str=time_text,
             ts=ts,
-            side=None,
+            side=side,
         )
         trades.append(trade)
 
@@ -223,7 +211,7 @@ async def fetch_rapira_new_trades(page: Page) -> List[RapiraDomTrade]:
     try:
         trades = await _parse_trades_from_page(page)
     except PlaywrightTimeoutError as e:
-        log.warning("History table not found: %s", e)
+        log.warning("parse error: %s", e)
         return []
 
     if not trades:
@@ -239,17 +227,16 @@ async def fetch_rapira_new_trades(page: Page) -> List[RapiraDomTrade]:
             idx = keys.index(_last_trade_key)
             new_trades = trades[idx + 1 :]
         except ValueError:
-            # если не нашли прошлую сделку — считаем новыми все
             new_trades = trades
 
     _last_trade_key = _build_trade_key(trades[-1])
     return new_trades
 
 
-# ============= MAIN-ЦИКЛ ==========================================
+# ================== MAIN-ЦИКЛ ======================================
 
 async def main():
-    install_chromium()  # как в рабочем проекте
+    install_chromium()
 
     playwright = None
     browser = None
@@ -269,12 +256,13 @@ async def main():
                 )
                 for t in new_trades:
                     log.info(
-                        "Trade %s | price=%.2f | volume=%.4f",
+                        "Trade %s | price=%.2f | volume=%.4f | side=%s",
                         t.time_str,
                         t.price,
                         t.volume,
+                        t.side or "-",
                     )
-                # здесь можно писать в БД / Supabase и т.п.
+                # здесь можно вместо логов писать в БД / Supabase и т.п.
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
