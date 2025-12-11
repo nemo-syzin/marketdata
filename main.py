@@ -20,6 +20,11 @@ GRINEX_URL = "https://grinex.io/trading/usdta7a5?lang=en"
 TIMEOUT_MS = 30_000
 MAX_TRADES = 20  # сколько последних сделок забирать максимум
 
+# Прокси (для продакшена лучше вынести в переменные окружения)
+PROXY_SERVER = "http://5.22.207.65:50100"
+PROXY_USERNAME = "nemosyzin"
+PROXY_PASSWORD = "TDbaTDHbTA"
+
 
 # ───────────── УСТАНОВКА CHROMIUM ДЛЯ PLAYWRIGHT ────
 def install_chromium_for_playwright() -> None:
@@ -84,11 +89,17 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
     Если попадаем на страницу с капчей – логируем это и возвращаем [].
     """
     async with async_playwright() as p:
-        logger.info("Launching Chromium ...")
+        logger.info("Launching Chromium with proxy ...")
         browser = await p.chromium.launch(
             headless=True,
+            proxy={
+                "server": PROXY_SERVER,
+                "username": PROXY_USERNAME,
+                "password": PROXY_PASSWORD,
+            },
             args=["--disable-blink-features=AutomationControlled"],
         )
+
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -111,18 +122,7 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
             await browser.close()
             return []
 
-        # Если это НЕ капча, пробуем найти таблицу последних сделок
-        # Структура по твоему скриншоту:
-        # <table class="table all-trades usdta7a5 table-updated size-4">
-        #   <tbody>
-        #     <tr id="market-trade-...">
-        #       <td class="price ...">...</td>
-        #       <td class="volume ...">Объем (USDT)</td>
-        #       <td class="volume ...">Объем (A7A5)</td>
-        #       <td class="time ...">Дата и время</td>
-        #     </tr>
-        #   </tbody>
-        # </table>
+        # Пытаемся найти таблицу последних сделок
         rows_locator = page.locator("table.all-trades.usdta7a5 tbody tr[id^='market-trade-']")
 
         rows_count = await rows_locator.count()
