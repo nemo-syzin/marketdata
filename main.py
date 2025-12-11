@@ -15,7 +15,6 @@ from supabase import Client, create_client
 from telegram.ext import ApplicationBuilder, CommandHandler
 
 # ───────────────────── CONFIG ───────────────────────
-# ▸ задайте переменные окружения в Render → Environment
 TOKEN = os.getenv("TG_BOT_TOKEN", "7128150617:AAHEMrzGrSOZrLAMYDf8F8MwklSvPDN2IVk")
 PASSWORD = os.getenv("TG_BOT_PASS", "7128150617")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jetfadpysjsvtqdgnsjp.supabase.co")
@@ -53,7 +52,7 @@ async def upsert_rate(source: str, sell: float, buy: float) -> None:
     """Пишем/обновляем запись в таблице kenig_rates (по полю source)."""
     payload = {
         "source": source,
-        "sell": round(sell, 2),
+            "sell": round(sell, 2),
         "buy": round(buy, 2),
         "updated_at": datetime.utcnow().isoformat(),
     }
@@ -100,8 +99,7 @@ def _parse_number(text: str) -> Optional[float]:
 
 async def fetch_grinex_rate() -> Tuple[Optional[float], Optional[float]]:
     """
-    ТВОЙ СТАРЫЙ РАБОЧИЙ ПАРСЕР СТАКАНА ГРИНЕКС (Ask/Bid).
-    Оставляем как есть, чтобы не ломать существующую логику.
+    Старый рабочий парсер стакана Grinex (Ask/Bid).
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -155,7 +153,7 @@ async def fetch_grinex_rate() -> Tuple[Optional[float], Optional[float]]:
 
 async def fetch_grinex_last_trades(limit: int = 50) -> list[dict]:
     """
-    НОВЫЙ ПАРСЕР: последние сделки с Grinex из блока trade_history_panel.
+    Новый парсер: последние сделки с Grinex из блока trade_history_panel.
 
     Возвращает список словарей:
     {
@@ -165,7 +163,7 @@ async def fetch_grinex_last_trades(limit: int = 50) -> list[dict]:
         "volume_usdt_raw": str,
         "volume_a7a5": float | None,
         "volume_a7a5_raw": str,
-        "time": str,          # строка с датой/временем как на сайте
+        "time": str,
     }
     """
     for attempt in range(1, MAX_RETRIES + 1):
@@ -197,17 +195,19 @@ async def fetch_grinex_last_trades(limit: int = 50) -> list[dict]:
                 except Exception:
                     pass
 
-                # если внезапно попали на капчу — не обходим, просто выходим
+                # капча — не обходим, просто логируем и выходим
                 try:
                     content = await page.content()
                     if "sp_rotated_captcha" in content:
-                        logger.warning("Grinex responded with rotated captcha page, no trades scraped.")
+                        logger.warning(
+                            "Grinex responded with rotated captcha page, no trades scraped."
+                        )
                         await browser.close()
                         return []
                 except Exception:
                     pass
 
-                # на всякий случай клик по вкладке "Последние сделки"
+                # клик по вкладке "Последние сделки" (на всякий случай)
                 try:
                     history_tab = page.locator(
                         "a[href='#tab_trade_history_all'], "
@@ -218,7 +218,7 @@ async def fetch_grinex_last_trades(limit: int = 50) -> list[dict]:
                 except Exception:
                     pass
 
-                # дать фронту дорисовать таблицу
+                # даём фронту дорисовать таблицу
                 await page.wait_for_timeout(2_000)
 
                 rows = await page.query_selector_all(
@@ -278,7 +278,18 @@ async def fetch_grinex_last_trades(limit: int = 50) -> list[dict]:
                         continue
 
                 await browser.close()
+
+                # ── ЛОГИРУЕМ СДЕЛКИ ──────────────────────
                 logger.info("Fetched %d Grinex trades", len(trades))
+                for t in trades[:10]:
+                    logger.info(
+                        "Grinex trade: time=%s price=%s RUB vol_usdt=%s vol_a7a5=%s",
+                        t.get("time"),
+                        t.get("price_raw"),
+                        t.get("volume_usdt_raw"),
+                        t.get("volume_a7a5_raw"),
+                    )
+
                 return trades
 
         except Exception as e:
@@ -415,8 +426,7 @@ async def show_offsets(update, context):
 
 async def trades_command(update, context):
     """
-    /trades — показать последние сделки Grinex USDT/A7A5.
-    Только для авторизованных.
+    /trades — показать последние сделки Grinex USDT/A7A5 (через бота).
     """
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Нет доступа. /auth <пароль>")
@@ -445,6 +455,21 @@ async def send_rates_message(app):
     bc_buy = await fetch_bestchange_buy()
     en_sell, en_buy, en_cbr = await fetch_energo()
     gr_ask, gr_bid = await fetch_grinex_rate()
+
+    # ── НОВОЕ: логируем последние сделки в каждом цикле ──
+    trades = await fetch_grinex_last_trades(limit=10)
+    if trades:
+        logger.info("Grinex last trades snapshot (first 10):")
+        for t in trades:
+            logger.info(
+                "Trade: time=%s price=%s RUB vol_usdt=%s vol_a7a5=%s",
+                t.get("time"),
+                t.get("price_raw"),
+                t.get("volume_usdt_raw"),
+                t.get("volume_a7a5_raw"),
+            )
+    else:
+        logger.warning("No Grinex last trades in current cycle.")
 
     ts = datetime.now(KALININGRAD_TZ).strftime("%d.%m.%Y %H:%M:%S")
     lines = [ts, ""]
