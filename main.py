@@ -13,7 +13,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
 )
 
-
 # ─────────────────── УСТАНОВКА BROWSERS ДЛЯ PLAYWRIGHT ───────────────────
 
 
@@ -67,41 +66,27 @@ def _normalize_num(text: str) -> float:
     return float(t)
 
 
-async def find_grinex_history_frame(page: Page) -> Optional[Frame]:
+async def debug_log_html_presence(page: Page) -> None:
     """
-    Ищем frame, внутри которого есть div#tab_trade_history_all.
-
-    Если он всё-таки в основном документе — вернём None, а дальше
-    будем работать с page.
+    Для отладки: проверяем, есть ли в HTML ключевые куски.
     """
-    frames = page.frames
-    logging.info("Page has %d frames (including main).", len(frames))
-
-    for fr in frames:
-        try:
-            # Просто пытаемся найти контейнер истории сделок в этом фрейме
-            el = await fr.query_selector("#tab_trade_history_all")
-            if el:
-                logging.info(
-                    "Found history container in frame with url=%s, name=%s",
-                    fr.url,
-                    fr.name,
-                )
-                return fr
-        except Exception:
-            continue
-
-    logging.info(
-        "No frame with '#tab_trade_history_all' found explicitly, "
-        "будем искать таблицу в основном документе."
-    )
-    return None
+    try:
+        html = await page.content()
+        has_tab = "#tab_trade_history_all" in html
+        has_all_trades = "all-trades usdta7a5" in html
+        logging.info(
+            "HTML debug: tab_trade_history_all present=%s, 'all-trades usdta7a5' present=%s",
+            has_tab,
+            has_all_trades,
+        )
+    except Exception as e:
+        logging.info("Failed to read page.content() for debug: %s", e)
 
 
 async def ensure_grinex_last_trades_tab(root: Any) -> None:
     """
     На всякий случай пытаемся кликнуть таб «Последние сделки».
-    root — это либо Page, либо Frame (у обоих есть .locator()).
+    root — это Page либо Frame (у обоих есть .locator()).
     """
     try:
         tab = root.locator("text=Последние сделки")
@@ -128,16 +113,16 @@ async def scroll_to_history_block(root: Any) -> None:
 
         if await target.count() > 0:
             await target.first.scroll_into_view_if_needed(timeout=5_000)
-            await root.wait_for_timeout(500)
+            await root.wait_for_timeout(300)
     except Exception as e:
         logging.info("Failed to scroll to history block: %s", e)
 
 
-async def poll_grinex_trade_rows(root: Any, max_wait_seconds: int = 40) -> List[Any]:
+async def poll_grinex_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[Any]:
     """
-    Ожидаем появления строк истории сделок на Grinex внутри root.
+    Каждую секунду обходим ВСЕ фреймы (включая main) и пытаемся найти строки сделок.
 
-    DOM по скрину:
+    Структура по твоему скрину:
       <div id="tab_trade_history_all">
         <div class="trade_history_all_wrapper default" data-market="usdta7a5_tab">
           <div class="trade_history_panel">
@@ -154,23 +139,49 @@ async def poll_grinex_trade_rows(root: Any, max_wait_seconds: int = 40) -> List[
     )
 
     for attempt in range(1, max_wait_seconds + 1):
-        rows = await root.query_selector_all(selector)
-        if rows:
-            logging.info(
-                "Found %d Grinex trade rows on attempt %d/%d.",
-                len(rows),
-                attempt,
-                max_wait_seconds,
-            )
-            return rows
+        frames: List[Frame] = page.frames
+        logging.info("Attempt %d/%d: page has %d frames.", attempt, max_wait_seconds, len(frames))
+
+        for fr in frames:
+            try:
+                # Чуть-чуть скроллим внутри фрейма (если возможно)
+                await scroll_to_history_block(fr)
+
+                rows = await fr.query_selector_all(selector)
+                if rows:
+                    logging.info(
+                        "Found %d Grinex trade rows in frame url=%s name=%s on attempt %d/%d.",
+                        len(rows),
+                        fr.url,
+                        fr.name,
+                        attempt,
+                        max_wait_seconds,
+                    )
+                    return rows
+            except Exception as e:
+                logging.info("Error while searching rows in frame %s: %s", fr.url, e)
+
+        # Параллельно проверяем main-document (на случай, если без фреймов)
+        try:
+            await scroll_to_history_block(page)
+            main_rows = await page.query_selector_all(selector)
+            if main_rows:
+                logging.info(
+                    "Found %d Grinex trade rows in main document on attempt %d/%d.",
+                    len(main_rows),
+                    attempt,
+                    max_wait_seconds,
+                )
+                return main_rows
+        except Exception as e:
+            logging.info("Error while searching rows in main document: %s", e)
 
         logging.info(
             "No trade rows found yet (attempt %d/%d), waiting 1 second...",
             attempt,
             max_wait_seconds,
         )
-        await scroll_to_history_block(root)
-        await root.wait_for_timeout(1_000)
+        await page.wait_for_timeout(1_000)
 
     logging.warning("No trade rows found by any of the candidate selectors.")
     return []
@@ -289,8 +300,8 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
     Основная функция:
     - гарантирует наличие браузера;
     - открывает страницу Grinex;
-    - находит нужный frame;
-    - парсит сделки.
+    - крутится по фреймам, ищет сделки;
+    - парсит и возвращает результат.
     """
     ensure_playwright_browsers()
 
@@ -324,15 +335,17 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
             # Даём фронту подгрузиться
             await page.wait_for_timeout(5_000)
 
-            # Ищем frame с историей
-            history_frame = await find_grinex_history_frame(page)
-            root: Any = history_frame if history_frame else page
+            await debug_log_html_presence(page)
 
-            await ensure_grinex_last_trades_tab(root)
-            await scroll_to_history_block(root)
+            # На всякий случай пробуем кликнуть вкладку и проскроллить в каждом фрейме
+            for fr in page.frames:
+                await ensure_grinex_last_trades_tab(fr)
+                await scroll_to_history_block(fr)
+            await ensure_grinex_last_trades_tab(page)
+            await scroll_to_history_block(page)
 
             logging.info("Trying to detect Grinex 'Последние сделки' table in DOM ...")
-            rows = await poll_grinex_trade_rows(root, max_wait_seconds=40)
+            rows = await poll_grinex_trade_rows(page, max_wait_seconds=40)
 
             if not rows:
                 logging.warning("No trade rows found on Grinex page.")
