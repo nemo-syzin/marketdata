@@ -4,7 +4,7 @@ import logging
 import subprocess
 from typing import Any, Dict, List
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, Frame
 
 # ───────────────────────── КОНСТАНТЫ ─────────────────────────
 
@@ -285,13 +285,12 @@ async def scrape_rapira_trades() -> Dict[str, Any]:
 
 # ───────────────────────── GRINEX ─────────────────────────
 
-
 async def ensure_last_trades_tab_grinex(page: Page) -> None:
     """
-    Жмём таб «Последние сделки» в блоке под графиком.
+    Жмём таб «Последние сделки» в центральном блоке под графиком.
     """
+    # 1) Нормальный путь: ролевая вкладка
     try:
-        # Сначала по роли таба
         tab = page.get_by_role("tab", name="Последние сделки")
         if await tab.count() > 0:
             logging.info("Clicking Grinex tab 'Последние сделки' (role=tab)...")
@@ -301,10 +300,11 @@ async def ensure_last_trades_tab_grinex(page: Page) -> None:
     except Exception as e:
         logging.info("Failed to click Grinex tab by role: %s", e)
 
-    # Фолбэк по селектору в nav-tabs
+    # 2) Фолбэк — по тексту/классам
     selectors = [
         "div.cContainerTrading .nav-tabs a:has-text('Последние сделки')",
         "a:has-text('Последние сделки')",
+        "button:has-text('Последние сделки')",
     ]
     for sel in selectors:
         try:
@@ -317,7 +317,39 @@ async def ensure_last_trades_tab_grinex(page: Page) -> None:
         except Exception as e:
             logging.info("Failed to click Grinex tab '%s': %s", sel, e)
 
-    logging.info("Grinex tab 'Последние сделки' not found explicitly, возможно, уже активна.")
+    logging.info(
+        "Grinex tab 'Последние сделки' not found explicitly, возможно, уже активна."
+    )
+
+
+async def _query_rows_in_all_frames(
+    page: Page, selector: str
+) -> List[Any]:
+    """
+    Ищем элементы по селектору во ВСЕХ фреймах страницы (main frame + iframes).
+    """
+    targets: List[Frame] = [page.main_frame] + page.frames
+    # page.main_frame уже в page.frames, но от этого хуже не будет
+
+    for frame in targets:
+        try:
+            rows = await frame.query_selector_all(selector)
+            if rows:
+                url = getattr(frame, "url", "unknown")
+                logging.info(
+                    "Found %d Grinex rows in frame '%s' using selector '%s'.",
+                    len(rows),
+                    url,
+                    selector,
+                )
+                return rows
+        except Exception as e:
+            logging.info(
+                "Error while querying selector '%s' in some frame: %s",
+                selector,
+                e,
+            )
+    return []
 
 
 async def poll_for_trade_rows_grinex(
@@ -326,16 +358,14 @@ async def poll_for_trade_rows_grinex(
     """
     Ожидаем появления строк в таблице 'Последние сделки' на Grinex.
 
-    Структура по скрину:
-      <div id="tab_trade_history_all" ...>
-        <div class="trade_history_panel">
-          <table class="table all-trades usdta7a5 ...">
-            <tbody>
-              <tr id="market-trade-..."> ... </tr>
+    По твоему скрину структура примерно такая:
+      <div class="trade_history_panel">
+        <table class="table all-trades usdta7a5 table-updated size-4">
+          <tbody>
+            <tr id="market-trade-..."> ... </tr>
     """
 
     selectors = [
-        "#tab_trade_history_all div.trade_history_panel table.all-trades tbody tr",
         "div.trade_history_panel table.all-trades tbody tr",
         "table.all-trades.usdta7a5 tbody tr",
         "table.all-trades tbody tr",
@@ -344,15 +374,8 @@ async def poll_for_trade_rows_grinex(
 
     for i in range(max_wait_seconds):
         for selector in selectors:
-            rows = await page.query_selector_all(selector)
+            rows = await _query_rows_in_all_frames(page, selector)
             if rows:
-                logging.info(
-                    "Found %d Grinex rows using selector '%s' on attempt %d/%d.",
-                    len(rows),
-                    selector,
-                    i + 1,
-                    max_wait_seconds,
-                )
                 return rows
 
         logging.info(
@@ -466,11 +489,13 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
             logging.info("Opening Grinex page %s ...", GRINEX_URL)
             await page.goto(GRINEX_URL, wait_until="networkidle", timeout=60_000)
 
+            # Чуть времени на фронт
             await page.wait_for_timeout(5_000)
 
             await accept_cookies_if_any(page)
             await ensure_last_trades_tab_grinex(page)
 
+            # Небольшая пауза после переключения таба
             await page.wait_for_timeout(2_000)
 
             logging.info("Trying to detect Grinex 'Последние сделки' table in DOM ...")
@@ -480,7 +505,7 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
                 logging.warning("No Grinex trade rows found.")
                 return {
                     "exchange": "grinex",
-                    "symbol": "USDT/A7A5",
+                    "symbol": "USDT/RUB (usdta7a5)",
                     "count": 0,
                     "trades": [],
                 }
@@ -490,7 +515,7 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
 
             return {
                 "exchange": "grinex",
-                "symbol": "USDT/A7A5",
+                "symbol": "USDT/RUB (usdta7a5)",
                 "count": len(trades),
                 "trades": trades,
             }
