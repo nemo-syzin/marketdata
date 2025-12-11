@@ -6,6 +6,9 @@ from typing import Any, Dict, List
 
 from playwright.async_api import async_playwright, Page
 
+# ───────────────────────── КОНСТАНТЫ ─────────────────────────
+
+RAPIRA_URL = "https://rapira.net/trading/usdt-rub"
 GRINEX_URL = "https://grinex.io/trading/usdta7a5"
 
 logging.basicConfig(
@@ -14,16 +17,13 @@ logging.basicConfig(
 )
 
 
-# ───────────────────────── УСТАНОВКА BROWSERS ─────────────────────────
+# ───────────────────────── ОБЩЕЕ: УСТАНОВКА BROWSERS ─────────────────────────
 
 
 def ensure_playwright_browsers() -> None:
     """
     Гарантируем, что нужные браузеры для Playwright скачаны.
-
-    ВАЖНО:
-    - только download (без системных deps)
-    - никаких su / --with-deps
+    Только download, без su / --with-deps.
     """
     try:
         logging.info("Ensuring Playwright Chromium is installed ...")
@@ -45,13 +45,13 @@ def ensure_playwright_browsers() -> None:
     except FileNotFoundError:
         logging.error(
             "playwright CLI not found in PATH. "
-            "Убедись, что Playwright установлен (npm/pip) и доступен как 'playwright'."
+            "Убедись, что Playwright установлен и доступен как 'playwright'."
         )
     except Exception as e:
         logging.error("Unexpected error while installing Playwright browsers: %s", e)
 
 
-# ───────────────────────── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ─────────────────────────
+# ───────────────────────── ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────
 
 
 async def close_silently(page: Page) -> None:
@@ -63,7 +63,7 @@ async def close_silently(page: Page) -> None:
 
 async def accept_cookies_if_any(page: Page) -> None:
     """
-    Нажимаем 'Я согласен' или аналогичный текст на баннере cookies, если он есть.
+    Нажимаем кнопку cookies, если она есть.
     """
     texts = ["Я согласен", "Согласен", "Принять", "Accept"]
     try:
@@ -79,71 +79,59 @@ async def accept_cookies_if_any(page: Page) -> None:
         logging.info("Ignoring cookies click error: %s", e)
 
 
-async def ensure_history_tab(page: Page) -> None:
+def _normalize_num(text: str) -> float:
     """
-    Активируем вкладку с историей сделок (trade_history_panel).
-
-    По DOM она живет в блоке:
-      <div class="tab-pane ... history-list" id="tab_trade_history_all">
-        <div class="trade_history_all_wrapper default" ...>
-          <div class="trade_history_panel">...</div>
+    Преобразует строку с пробелами и запятыми в float:
+    '191 889.47' / '191 889,47' / '2 573.54' -> float.
     """
+    t = text.replace("\xa0", " ").replace(" ", "")
+    t = t.replace(",", ".")
+    return float(t)
 
-    # 1. Пробуем по href/id таба
-    selectors = [
-        "a[href='#tab_trade_history_all']",
-        "a[data-target='#tab_trade_history_all']",
-        "li a[href='#tab_trade_history_all']",
+
+# ───────────────────────── RAPIRA ─────────────────────────
+
+
+async def ensure_last_trades_tab_rapira(page: Page) -> None:
+    """
+    Включаем вкладку 'Последние сделки' / 'История сделок' для Rapira.
+    """
+    candidates = [
+        "Последние сделки",
+        "История сделок",
+        "История",
     ]
-    for sel in selectors:
-        try:
-            tab = page.locator(sel)
-            if await tab.count() > 0:
-                logging.info("Clicking history tab via selector '%s'...", sel)
-                await tab.first.click(timeout=5_000)
-                await page.wait_for_timeout(1_000)
-                return
-        except Exception as e:
-            logging.info("Failed to click history tab '%s': %s", sel, e)
 
-    # 2. Фолбэк по тексту
-    text_candidates = ["История", "История сделок", "Сделки", "History"]
-    for text in text_candidates:
+    for text in candidates:
         try:
             tab = page.locator(f"text={text}")
             if await tab.count() > 0:
-                logging.info("Clicking history tab with text '%s'...", text)
+                logging.info("Clicking Rapira tab '%s' ...", text)
                 await tab.first.click(timeout=5_000)
                 await page.wait_for_timeout(1_000)
                 return
         except Exception as e:
-            logging.info("Failed to click history tab text '%s': %s", text, e)
+            logging.info("Failed to click Rapira tab '%s': %s", text, e)
 
     logging.info(
-        "History tab ('tab_trade_history_all') not found explicitly, "
-        "возможно, уже активна."
+        "Rapira last-trades tab not found explicitly, возможно, уже активна."
     )
 
 
-async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[Any]:
+async def poll_for_trade_rows_rapira(
+    page: Page, max_wait_seconds: int = 40
+) -> List[Any]:
     """
-    Ожидаем появления строк сделок в trade_history_panel.
-
-    По скрину структура такая:
-      <div class="trade_history_panel">
-        <table class="table table-updated size-4">  <-- заголовок
-        <table class="table all-trades usdta7a5 table-updated size-4">
-          <tbody>
-            <tr id="market-trade-...">
-              <td class="price text-left col-xs-6 text-up">...</td>
-              <td class="volume text-left col-xs-6" ...>...</td>
-              <td class="time text-left col-xs-6">...</td>
+    Ожидаем появления строк сделок в DOM Rapira.
     """
-
     selectors = [
-        "div.trade_history_panel table.all-trades tbody tr",
-        "div.trade_history_panel table.table.all-trades tbody tr",
-        "table.all-trades tbody tr",
+        "div.table-responsive.table-orders table.table-row-dashed tbody tr.table-orders-row",
+        "div.table-responsive.table-orders table.table-row-dashed tbody tr",
+        "div.table-responsive.table-orders table tbody tr.table-orders-row",
+        "div.table-responsive.table-orders table tbody tr",
+        "table.table-row-dashed tbody tr.table-orders-row",
+        "table.table-row-dashed tbody tr",
+        "tr.table-orders-row",
     ]
 
     for i in range(max_wait_seconds):
@@ -151,7 +139,7 @@ async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[An
             rows = await page.query_selector_all(selector)
             if rows:
                 logging.info(
-                    "Found %d rows using selector '%s' on attempt %d/%d.",
+                    "Found %d Rapira rows using selector '%s' on attempt %d/%d.",
                     len(rows),
                     selector,
                     i + 1,
@@ -160,39 +148,28 @@ async def poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[An
                 return rows
 
         logging.info(
-            "No trade rows found yet (attempt %d/%d), waiting 1 second...",
+            "No Rapira trade rows yet (attempt %d/%d), waiting 1 second...",
             i + 1,
             max_wait_seconds,
         )
         await page.wait_for_timeout(1_000)
 
-    logging.warning("No trade rows found by any of the candidate selectors.")
+    logging.warning("No Rapira history table rows found by any selector.")
     return []
 
 
-def _normalize_num(text: str) -> float:
+async def parse_trades_from_rows_rapira(rows: List[Any]) -> List[Dict[str, Any]]:
     """
-    Преобразует '191 889.47' / '191 889,47' / '2 573.54' -> float.
-    """
-    t = text.replace("\xa0", " ").replace(" ", "")
-    t = t.replace(",", ".")
-    return float(t)
-
-
-async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
-    """
-    Разбираем строки таблицы сделок Grinex.
-    Берем 3 ячейки: Цена, Объём, Дата и время.
+    Разбор строк Rapira: Цена / Объём / Время.
     """
     trades: List[Dict[str, Any]] = []
 
     for idx, row in enumerate(rows):
         try:
-            # на всякий случай берём и th, и td
             cells = await row.query_selector_all("th, td")
             if len(cells) < 3:
                 logging.info(
-                    "Row %d skipped: has only %d cells (need >= 3).",
+                    "Rapira row %d skipped: has only %d cells (need >= 3).",
                     idx,
                     len(cells),
                 )
@@ -200,21 +177,15 @@ async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
 
             price_text = (await cells[0].inner_text()).strip()
             volume_text = (await cells[1].inner_text()).strip()
-            time_raw = (await cells[2].inner_text()).strip()
-
-            # time_raw у Grinex выглядит примерно так:
-            # '14:02:48\n\n10.12.2025 14:02 "'
-            # берём только первое "слово" — собственно время сделки
-            time_parts = time_raw.split()
-            time_text = time_parts[0] if time_parts else time_raw
+            time_text = (await cells[2].inner_text()).strip()
 
             if not price_text or not volume_text or not time_text:
                 logging.info(
-                    "Row %d skipped: empty cell(s): price='%s', volume='%s', time='%s'",
+                    "Rapira row %d skipped: empty cell(s): price='%s', volume='%s', time='%s'",
                     idx,
                     price_text,
                     volume_text,
-                    time_raw,
+                    time_text,
                 )
                 continue
 
@@ -223,7 +194,7 @@ async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
                 volume = _normalize_num(volume_text)
             except Exception as conv_err:
                 logging.info(
-                    "Row %d skipped: cannot convert to float "
+                    "Rapira row %d skipped: cannot convert to float "
                     "(price='%s', volume='%s'): %s",
                     idx,
                     price_text,
@@ -242,20 +213,232 @@ async def parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
                 }
             )
         except Exception as e:
-            logging.info("Failed to parse trade row %d: %s", idx, e)
+            logging.info("Failed to parse Rapira row %d: %s", idx, e)
             continue
 
     return trades
 
 
-# ───────────────────────── ОСНОВНОЙ СКРАПЕР ─────────────────────────
+async def scrape_rapira_trades() -> Dict[str, Any]:
+    ensure_playwright_browsers()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 810},
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+
+        page = await context.new_page()
+
+        try:
+            logging.info("Opening Rapira page %s ...", RAPIRA_URL)
+            await page.goto(RAPIRA_URL, wait_until="networkidle", timeout=60_000)
+
+            await page.wait_for_timeout(5_000)
+
+            await accept_cookies_if_any(page)
+            await ensure_last_trades_tab_rapira(page)
+
+            await page.wait_for_timeout(3_000)
+
+            logging.info("Trying to detect Rapira last-trades table in DOM ...")
+            rows = await poll_for_trade_rows_rapira(page, max_wait_seconds=40)
+
+            if not rows:
+                logging.warning("No Rapira trade rows found.")
+                return {
+                    "exchange": "rapira",
+                    "symbol": "USDT/RUB",
+                    "count": 0,
+                    "trades": [],
+                }
+
+            trades = await parse_trades_from_rows_rapira(rows)
+            logging.info("Parsed %d Rapira trades.", len(trades))
+
+            return {
+                "exchange": "rapira",
+                "symbol": "USDT/RUB",
+                "count": len(trades),
+                "trades": trades,
+            }
+        finally:
+            await close_silently(page)
+            await context.close()
+            await browser.close()
+
+
+# ───────────────────────── GRINEX ─────────────────────────
+
+
+async def ensure_last_trades_tab_grinex(page: Page) -> None:
+    """
+    Жмём таб «Последние сделки» в блоке под графиком.
+    """
+    try:
+        # Сначала по роли таба
+        tab = page.get_by_role("tab", name="Последние сделки")
+        if await tab.count() > 0:
+            logging.info("Clicking Grinex tab 'Последние сделки' (role=tab)...")
+            await tab.first.click(timeout=5_000)
+            await page.wait_for_timeout(1_000)
+            return
+    except Exception as e:
+        logging.info("Failed to click Grinex tab by role: %s", e)
+
+    # Фолбэк по селектору в nav-tabs
+    selectors = [
+        "div.cContainerTrading .nav-tabs a:has-text('Последние сделки')",
+        "a:has-text('Последние сделки')",
+    ]
+    for sel in selectors:
+        try:
+            tab2 = page.locator(sel)
+            if await tab2.count() > 0:
+                logging.info("Clicking Grinex tab via selector '%s'...", sel)
+                await tab2.first.click(timeout=5_000)
+                await page.wait_for_timeout(1_000)
+                return
+        except Exception as e:
+            logging.info("Failed to click Grinex tab '%s': %s", sel, e)
+
+    logging.info("Grinex tab 'Последние сделки' not found explicitly, возможно, уже активна.")
+
+
+async def poll_for_trade_rows_grinex(
+    page: Page, max_wait_seconds: int = 40
+) -> List[Any]:
+    """
+    Ожидаем появления строк в таблице 'Последние сделки' на Grinex.
+
+    Структура по скрину:
+      <div id="tab_trade_history_all" ...>
+        <div class="trade_history_panel">
+          <table class="table all-trades usdta7a5 ...">
+            <tbody>
+              <tr id="market-trade-..."> ... </tr>
+    """
+
+    selectors = [
+        "#tab_trade_history_all div.trade_history_panel table.all-trades tbody tr",
+        "div.trade_history_panel table.all-trades tbody tr",
+        "table.all-trades.usdta7a5 tbody tr",
+        "table.all-trades tbody tr",
+        "tr[id^='market-trade-']",
+    ]
+
+    for i in range(max_wait_seconds):
+        for selector in selectors:
+            rows = await page.query_selector_all(selector)
+            if rows:
+                logging.info(
+                    "Found %d Grinex rows using selector '%s' on attempt %d/%d.",
+                    len(rows),
+                    selector,
+                    i + 1,
+                    max_wait_seconds,
+                )
+                return rows
+
+        logging.info(
+            "No Grinex trade rows yet (attempt %d/%d), waiting 1 second...",
+            i + 1,
+            max_wait_seconds,
+        )
+        await page.wait_for_timeout(1_000)
+
+    logging.warning(
+        "No Grinex trade rows found by any selector for table 'Последние сделки'."
+    )
+    return []
+
+
+async def parse_trades_from_rows_grinex(rows: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Разбор строк Grinex:
+      Цена / Объём (USDT) / Объём (A7A5) / Дата и время.
+    """
+    trades: List[Dict[str, Any]] = []
+
+    for idx, row in enumerate(rows):
+        try:
+            cells = await row.query_selector_all("td")
+            if len(cells) < 4:
+                logging.info(
+                    "Grinex row %d skipped: has only %d cells (need >= 4).",
+                    idx,
+                    len(cells),
+                )
+                continue
+
+            price_text = (await cells[0].inner_text()).strip()
+            vol_usdt_text = (await cells[1].inner_text()).strip()
+            vol_a7a5_text = (await cells[2].inner_text()).strip()
+            datetime_text = (await cells[3].inner_text()).strip()
+
+            if not price_text or not vol_usdt_text or not vol_a7a5_text or not datetime_text:
+                logging.info(
+                    "Grinex row %d skipped: empty cell(s): price='%s', usdt='%s', a7a5='%s', dt='%s'",
+                    idx,
+                    price_text,
+                    vol_usdt_text,
+                    vol_a7a5_text,
+                    datetime_text,
+                )
+                continue
+
+            try:
+                price = _normalize_num(price_text)
+                vol_usdt = _normalize_num(vol_usdt_text)
+                vol_a7a5 = _normalize_num(vol_a7a5_text)
+            except Exception as conv_err:
+                logging.info(
+                    "Grinex row %d skipped: cannot convert to float "
+                    "(price='%s', usdt='%s', a7a5='%s'): %s",
+                    idx,
+                    price_text,
+                    vol_usdt_text,
+                    vol_a7a5_text,
+                    conv_err,
+                )
+                continue
+
+            trades.append(
+                {
+                    "price": price,
+                    "volume_usdt": vol_usdt,
+                    "volume_a7a5": vol_a7a5,
+                    "datetime": datetime_text,
+                    "price_raw": price_text,
+                    "volume_usdt_raw": vol_usdt_text,
+                    "volume_a7a5_raw": vol_a7a5_text,
+                }
+            )
+        except Exception as e:
+            logging.info("Failed to parse Grinex row %d: %s", idx, e)
+            continue
+
+    return trades
 
 
 async def scrape_grinex_trades() -> Dict[str, Any]:
-    # 1. Сначала гарантируем, что браузеры скачаны
     ensure_playwright_browsers()
 
-    # 2. Запускаем Playwright
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -283,33 +466,31 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
             logging.info("Opening Grinex page %s ...", GRINEX_URL)
             await page.goto(GRINEX_URL, wait_until="networkidle", timeout=60_000)
 
-            # Даём фронту немного времени подтянуть данные
             await page.wait_for_timeout(5_000)
 
             await accept_cookies_if_any(page)
-            await ensure_history_tab(page)
+            await ensure_last_trades_tab_grinex(page)
 
-            # Ещё пауза после переключения таба
-            await page.wait_for_timeout(3_000)
+            await page.wait_for_timeout(2_000)
 
-            logging.info("Trying to detect Grinex history table in DOM ...")
-            rows = await poll_for_trade_rows(page, max_wait_seconds=40)
+            logging.info("Trying to detect Grinex 'Последние сделки' table in DOM ...")
+            rows = await poll_for_trade_rows_grinex(page, max_wait_seconds=40)
 
             if not rows:
-                logging.warning("No trade rows found on Grinex page.")
+                logging.warning("No Grinex trade rows found.")
                 return {
                     "exchange": "grinex",
-                    "symbol": "USDT/RUB (usdta7a5)",
+                    "symbol": "USDT/A7A5",
                     "count": 0,
                     "trades": [],
                 }
 
-            trades = await parse_trades_from_rows(rows)
-            logging.info("Parsed %d trades.", len(trades))
+            trades = await parse_trades_from_rows_grinex(rows)
+            logging.info("Parsed %d Grinex trades.", len(trades))
 
             return {
                 "exchange": "grinex",
-                "symbol": "USDT/RUB (usdta7a5)",
+                "symbol": "USDT/A7A5",
                 "count": len(trades),
                 "trades": trades,
             }
@@ -323,9 +504,19 @@ async def scrape_grinex_trades() -> Dict[str, Any]:
 
 
 async def main() -> None:
-    logging.info("Starting Grinex last-trades scraper ...")
-    result = await scrape_grinex_trades()
-    logging.info("Scraper finished.")
+    logging.info("Starting combined scrapers (Rapira + Grinex) ...")
+
+    rapira, grinex = await asyncio.gather(
+        scrape_rapira_trades(),
+        scrape_grinex_trades(),
+    )
+
+    result = {
+        "rapira": rapira,
+        "grinex": grinex,
+    }
+
+    logging.info("All scrapers finished.")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
