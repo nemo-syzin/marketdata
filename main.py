@@ -49,16 +49,12 @@ def parse_float(text: str) -> Optional[float]:
     if not text:
         return None
     cleaned = text.replace("\xa0", " ").strip()
-    # оставляем только цифры, запятую, точку
     filtered = "".join(ch for ch in cleaned if ch.isdigit() or ch in ",.")
     if not filtered:
         return None
-    # если и запятая и точка – предположим, что точка = десятичный разделитель
     if "," in filtered and "." in filtered:
-        # убираем пробелы-разделители тысяч, запятую тоже можно убрать
         filtered = filtered.replace(" ", "").replace(",", "")
     else:
-        # если только запятая – считаем её десятичной
         filtered = filtered.replace(",", ".")
     try:
         return float(filtered)
@@ -68,8 +64,7 @@ def parse_float(text: str) -> Optional[float]:
 
 def is_captcha_page(html: str) -> bool:
     """
-    Простейшая эвристика: определяем, что нас редиректнуло
-    на страницу rotated-captcha, а не на реальную торговую.
+    Эвристика: страница с rotated-captcha вместо торгового интерфейса.
     """
     markers = [
         "sp_rotated_captcha",
@@ -114,6 +109,12 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
 
         # Берём HTML, чтобы понять, что именно нам отдали
         html = await page.content()
+
+        # Логируем первые 4000 символов для диагностики
+        snippet = html[:4000].replace("\n", "")
+        logger.info("HTML snippet (first 4000 chars): %s", snippet)
+
+        # Проверяем на капчу
         if is_captcha_page(html):
             logger.warning(
                 "Looks like Grinex returned rotated-captcha page. "
@@ -129,7 +130,6 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
         logger.info("Detected %s trade rows in table selector.", rows_count)
 
         if rows_count == 0:
-            # Дополнительная диагностика: проверим наличие классов и id
             has_tab = "#tab_trade_history_all" in html
             has_table = "all-trades usdta7a5" in html
             logger.info(
@@ -151,7 +151,6 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
             vol_a7a5_td = row.locator("td.volume").nth(1)
             time_td = row.locator("td.time")
 
-            # Берём текст
             price_text = (await price_td.inner_text()).strip()
             vol_usdt_text = (await vol_usdt_td.inner_text()).strip()
             vol_a7a5_text = (await vol_a7a5_td.inner_text()).strip()
@@ -166,7 +165,6 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
                 "price": parse_float(price_text),
                 "volume_usdt": parse_float(vol_usdt_text),
                 "volume_a7a5": parse_float(vol_a7a5_text),
-                # парсить дату/время можно отдельно, пока оставляем строкой
             }
             trades.append(trade)
 
@@ -191,7 +189,6 @@ async def main() -> None:
         "trades": trades,
     }
 
-    # Логируем красивым JSON
     logger.info("Grinex last trades snapshot:\n%s", json.dumps(result, ensure_ascii=False, indent=2))
 
 
