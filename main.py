@@ -10,53 +10,51 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import certifi
 import httpx
-from playwright.async_api import async_playwright, Page, Locator
+from playwright.async_api import async_playwright, Page, Locator, Frame
 
-# ============================================================
-# Render ENV (обязательно для стабильного Playwright):
+# =========================
+# ENV (Render)
+# =========================
+# обязательно:
 #   PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.cache/ms-playwright
+#
 # ABCEX:
 #   ABCEX_EMAIL=...
 #   ABCEX_PASSWORD=...
-# Опционально:
-#   POLL_SEC=15
+#
+# опционально:
+#   POLL_SEC=10
 #   LIMIT=20
 #   GRINEX_MARKET=usdta7a5
 #   ABCEX_HEADLESS=1
-# ============================================================
+#   PROXY_SERVER=http://host:port
+#   PROXY_USERNAME=...
+#   PROXY_PASSWORD=...
+#
+#   RAPIRA_GOTO_WAIT=networkidle|domcontentloaded   (по умолчанию networkidle)
+# =========================
 
-# ───────────────────── GLOBAL CONFIG ───────────────────────
-POLL_SEC = float(os.getenv("POLL_SEC", "15"))
+POLL_SEC = float(os.getenv("POLL_SEC", "10"))
 LIMIT = int(os.getenv("LIMIT", "20"))
 
-# ───────────────────── LOGGING ─────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 log = logging.getLogger("three-exchanges")
-
-# уменьшаем шум httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# ============================================================
-#  PLAYWRIGHT INSTALL (устойчиво для Render)
-# ============================================================
+# =========================
+# Playwright install (Render-safe)
+# =========================
 
 def ensure_playwright_browsers() -> None:
-    """
-    Гарантируем, что нужные браузеры для Playwright скачаны.
-
-    ВАЖНО (Render):
-    - фиксируем PLAYWRIGHT_BROWSERS_PATH, чтобы install и runtime использовали один путь
-    - ставим через `playwright` (если есть), иначе через `python -m playwright`
-    """
     if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/src/.cache/ms-playwright"
 
@@ -91,8 +89,21 @@ def ensure_playwright_browsers() -> None:
     except Exception as e:
         log.error("Unexpected error while installing Playwright browsers: %s", e)
 
+def _proxy_config() -> Optional[Dict[str, str]]:
+    server = os.getenv("PROXY_SERVER")
+    if not server:
+        return None
+    cfg: Dict[str, str] = {"server": server}
+    u = os.getenv("PROXY_USERNAME")
+    p = os.getenv("PROXY_PASSWORD")
+    if u:
+        cfg["username"] = u
+    if p:
+        cfg["password"] = p
+    return cfg
+
 # ============================================================
-#  1) RAPIRA SCRAPER (твоя логика)
+# 1) RAPIRA (твоя логика, без изменений парсинга; добавлен retry на goto)
 # ============================================================
 
 RAPIRA_URL = "https://rapira.net/exchange/USDT_RUB"
@@ -128,9 +139,7 @@ async def rapira_ensure_last_trades_tab(page: Page) -> None:
         except Exception as e:
             rapira_log.info("Failed to click tab '%s': %s", text, e)
 
-    rapira_log.info(
-        "Last-trades tab not found explicitly, возможно, уже активна."
-    )
+    rapira_log.info("Last-trades tab not found explicitly, возможно, уже активна.")
 
 async def rapira_poll_for_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[Any]:
     selectors = [
@@ -166,8 +175,7 @@ def rapira_normalize_num(text: str) -> float:
 
 async def rapira_parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]:
     trades: List[Dict[str, Any]] = []
-
-    for idx, row in enumerate(rows):
+    for row in rows:
         try:
             cells = await row.query_selector_all("th, td")
             if len(cells) < 3:
@@ -189,7 +197,7 @@ async def rapira_parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]
             trades.append(
                 {
                     "price": price,
-                    "qty": volume,     # qty в USDT (как у тебя было volume)
+                    "qty": volume,
                     "time": time_text,
                     "price_raw": price_text,
                     "qty_raw": volume_text,
@@ -197,12 +205,12 @@ async def rapira_parse_trades_from_rows(rows: List[Any]) -> List[Dict[str, Any]]
             )
         except Exception:
             continue
-
     return trades
 
-def compute_turnover_vwap_from_qty(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_metrics_qty(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not trades:
         return {"count": 0, "sum_qty_usdt": 0.0, "turnover_quote": 0.0, "vwap": None}
+
     sum_qty = 0.0
     turnover = 0.0
     for t in trades:
@@ -210,13 +218,17 @@ def compute_turnover_vwap_from_qty(trades: List[Dict[str, Any]]) -> Dict[str, An
         p = float(t["price"])
         sum_qty += q
         turnover += q * p
+
     vwap = turnover / sum_qty if sum_qty > 0 else None
     return {"count": len(trades), "sum_qty_usdt": sum_qty, "turnover_quote": turnover, "vwap": vwap}
 
 async def scrape_rapira_trades(limit: int = LIMIT) -> Dict[str, Any]:
+    wait_until = os.getenv("RAPIRA_GOTO_WAIT", "networkidle").strip()
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
+            proxy=_proxy_config(),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -236,7 +248,13 @@ async def scrape_rapira_trades(limit: int = LIMIT) -> Dict[str, Any]:
         page = await context.new_page()
         try:
             rapira_log.info("Opening Rapira page %s ...", RAPIRA_URL)
-            await page.goto(RAPIRA_URL, wait_until="networkidle", timeout=60_000)
+
+            # иногда networkidle на Render подвисает — делаем 2 попытки
+            try:
+                await page.goto(RAPIRA_URL, wait_until=wait_until, timeout=60_000)
+            except Exception:
+                await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+
             await page.wait_for_timeout(5_000)
 
             await rapira_accept_cookies_if_any(page)
@@ -244,25 +262,16 @@ async def scrape_rapira_trades(limit: int = LIMIT) -> Dict[str, Any]:
             await page.wait_for_timeout(3_000)
 
             rows = await rapira_poll_for_trade_rows(page, max_wait_seconds=40)
-            if not rows:
-                return {
-                    "exchange": "rapira",
-                    "symbol": "USDT/RUB",
-                    "url": RAPIRA_URL,
-                    **{"count": 0, "sum_qty_usdt": 0.0, "turnover_quote": 0.0, "vwap": None},
-                    "trades": [],
-                }
-
-            trades = await rapira_parse_trades_from_rows(rows)
+            trades = await rapira_parse_trades_from_rows(rows) if rows else []
             trades = trades[:limit]
-            metrics = compute_turnover_vwap_from_qty(trades)
 
+            metrics = compute_metrics_qty(trades)
             return {
                 "exchange": "rapira",
                 "symbol": "USDT/RUB",
                 "url": RAPIRA_URL,
-                **metrics,
                 "quote_ccy": "RUB",
+                **metrics,
                 "trades": trades,
             }
         finally:
@@ -277,7 +286,7 @@ async def scrape_rapira_trades(limit: int = LIMIT) -> Dict[str, Any]:
                 pass
 
 # ============================================================
-#  2) GRINEX (твоя логика, но ОДНОРАЗОВЫЙ fetch для общего цикла)
+# 2) GRINEX (httpx как было + fallback на Playwright при HTML)
 # ============================================================
 
 grinex_log = logging.getLogger("grinex")
@@ -285,6 +294,7 @@ grinex_log = logging.getLogger("grinex")
 BASE_URL = "https://grinex.io"
 MARKET = os.getenv("GRINEX_MARKET", "usdta7a5")
 TRADES_URL = f"{BASE_URL}/api/v2/trades?market={MARKET}&limit={LIMIT}&order_by=desc"
+TRADING_URL = f"{BASE_URL}/trading/{MARKET}?lang=ru"
 
 HEADERS = {
     "User-Agent": (
@@ -294,17 +304,17 @@ HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": f"{BASE_URL}/trading/{MARKET}?lang=ru",
+    "Referer": TRADING_URL,
 }
 
 @dataclass(frozen=True)
 class GrinexTrade:
     price: float
-    amount: float  # base (USDT)
-    total: float   # quote (A7A5)
+    amount: float
+    total: float
     ts_utc: datetime
     tid: Optional[str] = None
-    side: Optional[str] = None  # buy/sell
+    side: Optional[str] = None
 
 def grinex_as_float(x: Any) -> Optional[float]:
     try:
@@ -341,11 +351,20 @@ def grinex_parse_side(obj: Dict[str, Any]) -> Optional[str]:
                 return s
     return None
 
+def grinex_extract_trades(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for k in ("trades", "data", "result"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+    return []
+
 def grinex_normalize_trade(t: Dict[str, Any]) -> Optional[GrinexTrade]:
     price = grinex_as_float(t.get("price"))
     amount = grinex_as_float(t.get("amount")) or grinex_as_float(t.get("volume"))
     total = grinex_as_float(t.get("total")) or grinex_as_float(t.get("funds")) or grinex_as_float(t.get("quote_volume"))
-
     if price is None or amount is None:
         return None
     if total is None:
@@ -366,17 +385,35 @@ def grinex_normalize_trade(t: Dict[str, Any]) -> Optional[GrinexTrade]:
         side=grinex_parse_side(t),
     )
 
-def grinex_extract_trades(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if isinstance(payload, dict):
-        for k in ("trades", "data", "result"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-    return []
+def _grinex_pack(trades: List[GrinexTrade]) -> Dict[str, Any]:
+    trades = trades[:LIMIT]
+    sum_usdt = sum(t.amount for t in trades)
+    sum_quote = sum(t.total for t in trades)
+    vwap = (sum(t.price * t.amount for t in trades) / sum_usdt) if sum_usdt > 0 else None
 
-async def fetch_grinex_trades_once() -> Dict[str, Any]:
+    return {
+        "exchange": "grinex",
+        "symbol": "USDT/A7A5",
+        "url": TRADES_URL,
+        "quote_ccy": "A7A5",
+        "count": len(trades),
+        "sum_qty_usdt": float(sum_usdt),
+        "turnover_quote": float(sum_quote),
+        "vwap": float(vwap) if vwap is not None else None,
+        "trades": [
+            {
+                "price": t.price,
+                "qty": t.amount,
+                "total": t.total,
+                "time_utc": t.ts_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                "side": t.side,
+                "id": t.tid,
+            }
+            for t in trades
+        ],
+    }
+
+async def fetch_grinex_httpx() -> Dict[str, Any]:
     async with httpx.AsyncClient(
         headers=HEADERS,
         timeout=15,
@@ -387,21 +424,14 @@ async def fetch_grinex_trades_once() -> Dict[str, Any]:
         grinex_log.info("HTTP %s %s", r.status_code, TRADES_URL)
         r.raise_for_status()
 
-        # На Render ты ловил JSONDecodeError: "Expecting value..."
-        # Это происходит, когда прилетает HTML/пусто/не-JSON. Делаем безопасный разбор.
         text = (r.text or "").strip()
         if not text:
-            raise ValueError("Empty response body from Grinex trades endpoint")
+            raise ValueError("Empty response body from Grinex")
         if text.startswith("<"):
             raise ValueError(f"Non-JSON response (HTML?) from Grinex: {text[:200]}")
 
-        try:
-            payload = r.json()
-        except Exception as e:
-            raise ValueError(f"Failed to parse JSON from Grinex: {e}. Body head: {text[:200]}")
-
+        payload = r.json()
         raw = grinex_extract_trades(payload)
-
         trades: List[GrinexTrade] = []
         for item in raw:
             tr = grinex_normalize_trade(item)
@@ -409,36 +439,78 @@ async def fetch_grinex_trades_once() -> Dict[str, Any]:
                 trades.append(tr)
 
         trades.sort(key=lambda x: x.ts_utc, reverse=True)
-        trades = trades[:LIMIT]
+        return _grinex_pack(trades)
 
-        sum_usdt = sum(t.amount for t in trades)
-        sum_quote = sum(t.total for t in trades)
-        vwap = (sum(t.price * t.amount for t in trades) / sum_usdt) if sum_usdt > 0 else None
-
-        return {
-            "exchange": "grinex",
-            "symbol": "USDT/A7A5",
-            "url": TRADES_URL,
-            "count": len(trades),
-            "sum_qty_usdt": float(sum_usdt),
-            "turnover_quote": float(sum_quote),
-            "vwap": float(vwap) if vwap is not None else None,
-            "quote_ccy": "A7A5",
-            "trades": [
-                {
-                    "price": t.price,
-                    "qty": t.amount,
-                    "total": t.total,
-                    "time_utc": t.ts_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                    "side": t.side,
-                    "id": t.tid,
-                }
-                for t in trades
+async def fetch_grinex_playwright() -> Dict[str, Any]:
+    # Фоллбек: заходим браузером, получаем cookies, затем дергаем API через page.request
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            proxy=_proxy_config(),
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
             ],
-        }
+        )
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 810},
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            user_agent=HEADERS["User-Agent"],
+        )
+        page = await context.new_page()
+        try:
+            grinex_log.warning("Grinex returned HTML; switching to Playwright fallback via %s", TRADING_URL)
+            await page.goto(TRADING_URL, wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(3_000)
+
+            resp = await page.request.get(TRADES_URL, headers=HEADERS, timeout=30_000)
+            if not resp.ok:
+                raise ValueError(f"Playwright request failed: HTTP {resp.status} {TRADES_URL}")
+
+            text = (await resp.text()).strip()
+            if not text or text.startswith("<"):
+                raise ValueError(f"Playwright got non-JSON too. Body head: {text[:200]}")
+
+            payload = await resp.json()
+            raw = grinex_extract_trades(payload)
+
+            trades: List[GrinexTrade] = []
+            for item in raw:
+                tr = grinex_normalize_trade(item)
+                if tr:
+                    trades.append(tr)
+
+            trades.sort(key=lambda x: x.ts_utc, reverse=True)
+            return _grinex_pack(trades)
+
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+async def fetch_grinex_once() -> Dict[str, Any]:
+    try:
+        return await fetch_grinex_httpx()
+    except Exception as e:
+        # если это HTML-антибот — идем через браузер
+        msg = str(e)
+        if "Non-JSON response" in msg or "HTML" in msg:
+            return await fetch_grinex_playwright()
+        raise
 
 # ============================================================
-#  3) ABCEX (твоя логика)
+# 3) ABCEX (твоя логика сделок + поиск логин-формы по frames + лог входов)
 # ============================================================
 
 abcex_log = logging.getLogger("abcex")
@@ -471,6 +543,29 @@ async def abcex_save_debug(page: Page, html_path: str, png_path: str) -> None:
     except Exception as e:
         abcex_log.info("Could not save html: %s", e)
 
+async def abcex_log_visible_inputs(page: Page) -> None:
+    try:
+        data = await page.evaluate(
+            """() => {
+              const els = Array.from(document.querySelectorAll('input,textarea,select'))
+                .filter(el => {
+                  const r = el.getBoundingClientRect();
+                  const style = window.getComputedStyle(el);
+                  return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                })
+                .slice(0, 30)
+                .map(el => {
+                  const attrs = {};
+                  for (const a of el.attributes) attrs[a.name] = a.value;
+                  return { tag: el.tagName.toLowerCase(), attrs, outer: el.outerHTML.slice(0, 300) };
+                });
+              return els;
+            }"""
+        )
+        abcex_log.warning("ABCEX visible inputs sample (top 30): %s", json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        abcex_log.warning("Failed to dump visible inputs: %s", e)
+
 async def abcex_accept_cookies_if_any(page: Page) -> None:
     candidates = ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]
     for txt in candidates:
@@ -497,68 +592,150 @@ class AbcexTrade:
     price_raw: str
     qty_raw: str
 
-async def abcex_is_login_visible(page: Page) -> bool:
+def _all_scopes(page: Page) -> List[Any]:
+    # Page + все frames
+    scopes: List[Any] = [page]
     try:
-        pw = page.locator("input[type='password']")
-        if await pw.count() > 0 and await pw.first.is_visible():
-            return True
+        scopes.extend(page.frames)
     except Exception:
         pass
-    return False
+    return scopes
+
+async def _is_login_visible_anywhere(page: Page) -> Tuple[bool, Any]:
+    # если password есть в каком-то frame — логин нужен, и вернем scope (page/frame)
+    for scope in _all_scopes(page):
+        try:
+            pw = scope.locator("input[type='password']")
+            if await pw.count() > 0 and await pw.first.is_visible():
+                return True, scope
+        except Exception:
+            continue
+    return False, page
+
+async def _pick_email_locator(scope: Any) -> Optional[Locator]:
+    # можно переопределить через ENV, если понадобится
+    env_sel = os.getenv("ABCEX_EMAIL_SELECTOR")
+    if env_sel:
+        loc = scope.locator(env_sel)
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                return loc.first
+        except Exception:
+            pass
+
+    candidates = [
+        "input[type='email']",
+        "input[autocomplete='email']",
+        "input[name*='mail' i]",
+        "input[id*='mail' i]",
+        "input[placeholder*='mail' i]",
+        "input[placeholder*='email' i]",
+        "input[placeholder*='почт' i]",
+        "input[aria-label*='mail' i]",
+        "input[aria-label*='email' i]",
+        "input[aria-label*='почт' i]",
+    ]
+    for sel in candidates:
+        loc = scope.locator(sel)
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                return loc.first
+        except Exception:
+            continue
+
+    # fallback: первый видимый input, который не password
+    fallback = scope.locator("input:not([type='password'])")
+    try:
+        if await fallback.count() > 0:
+            for i in range(min(await fallback.count(), 10)):
+                el = fallback.nth(i)
+                try:
+                    if await el.is_visible():
+                        return el
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return None
+
+async def _pick_password_locator(scope: Any) -> Optional[Locator]:
+    env_sel = os.getenv("ABCEX_PASSWORD_SELECTOR")
+    if env_sel:
+        loc = scope.locator(env_sel)
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                return loc.first
+        except Exception:
+            pass
+
+    candidates = [
+        "input[type='password']",
+        "input[autocomplete='current-password']",
+        "input[name*='pass' i]",
+        "input[id*='pass' i]",
+        "input[placeholder*='парол' i]",
+        "input[placeholder*='password' i]",
+        "input[aria-label*='парол' i]",
+        "input[aria-label*='password' i]",
+    ]
+    for sel in candidates:
+        loc = scope.locator(sel)
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                return loc.first
+        except Exception:
+            continue
+    return None
 
 async def abcex_login_if_needed(page: Page, email: str, password: str) -> None:
-    if not await abcex_is_login_visible(page):
+    needed, scope = await _is_login_visible_anywhere(page)
+    if not needed:
         abcex_log.info("Login not required (already in session).")
         return
 
-    abcex_log.info("Login detected. Performing sign-in ...")
+    abcex_log.info("Login detected. Performing sign-in ... (scope=%s)", type(scope).__name__)
 
-    email_candidates = [
-        "input[type='email']",
-        "input[name='email']",
-        "input[placeholder*='mail' i]",
-        "input[placeholder*='Email' i]",
-        "input[placeholder*='Почта' i]",
-        "input[placeholder*='E-mail' i]",
-    ]
-    pw_candidates = [
-        "input[type='password']",
-        "input[name='password']",
-        "input[placeholder*='Пароль' i]",
-        "input[placeholder*='Password' i]",
-    ]
+    email_loc = await _pick_email_locator(scope)
+    pw_loc = await _pick_password_locator(scope)
 
-    email_filled = False
-    for sel in email_candidates:
-        loc = page.locator(sel)
-        try:
-            if await loc.count() > 0 and await loc.first.is_visible():
-                await loc.first.fill(email, timeout=10_000)
-                email_filled = True
-                break
-        except Exception:
-            continue
-
-    pw_filled = False
-    for sel in pw_candidates:
-        loc = page.locator(sel)
-        try:
-            if await loc.count() > 0 and await loc.first.is_visible():
-                await loc.first.fill(password, timeout=10_000)
-                pw_filled = True
-                break
-        except Exception:
-            continue
-
-    if not email_filled or not pw_filled:
+    if email_loc is None or pw_loc is None:
+        await abcex_log_visible_inputs(page)
         await abcex_save_debug(page, "abcex_login_fields_not_found.html", "abcex_login_fields_not_found.png")
         raise RuntimeError("Не смог найти поля email/password. См. abcex_login_fields_not_found.*")
 
+    # fill email
+    try:
+        await email_loc.click(timeout=10_000)
+        await email_loc.fill(email, timeout=10_000)
+    except Exception:
+        try:
+            await email_loc.click(timeout=10_000)
+            await page.keyboard.type(email)
+        except Exception:
+            await abcex_log_visible_inputs(page)
+            await abcex_save_debug(page, "abcex_login_email_fill_failed.html", "abcex_login_email_fill_failed.png")
+            raise
+
+    # fill password
+    try:
+        await pw_loc.click(timeout=10_000)
+        await pw_loc.fill(password, timeout=10_000)
+    except Exception:
+        try:
+            await pw_loc.click(timeout=10_000)
+            await page.keyboard.type(password)
+        except Exception:
+            await abcex_log_visible_inputs(page)
+            await abcex_save_debug(page, "abcex_login_pass_fill_failed.html", "abcex_login_pass_fill_failed.png")
+            raise
+
+    # click login button (в том же scope)
     btn_texts = ["Войти", "Вход", "Sign in", "Login", "Войти в аккаунт"]
     clicked = False
     for t in btn_texts:
         try:
-            btn = page.locator(f"button:has-text('{t}')")
+            btn = scope.locator(f"button:has-text('{t}')")
             if await btn.count() > 0 and await btn.first.is_visible():
                 await btn.first.click(timeout=10_000)
                 clicked = True
@@ -581,10 +758,14 @@ async def abcex_login_if_needed(page: Page, email: str, password: str) -> None:
 
     await page.wait_for_timeout(2_500)
 
-    if await abcex_is_login_visible(page):
+    # проверка: password пропал во всех scopes
+    still, _ = await _is_login_visible_anywhere(page)
+    if still:
+        await abcex_log_visible_inputs(page)
         await abcex_save_debug(page, "abcex_login_failed.html", "abcex_login_failed.png")
-        raise RuntimeError("Логин не прошёл (форма логина всё ещё видна). Возможны 2FA/капча/иной флоу.")
-    abcex_log.info("Login successful (form disappeared).")
+        raise RuntimeError("Логин не прошёл (password всё ещё виден). Возможны 2FA/капча/иной флоу.")
+
+    abcex_log.info("Login successful (password disappeared).")
 
 async def abcex_click_trades_tab_best_effort(page: Page) -> None:
     candidates = ["Сделки", "История", "Order history", "Trades"]
@@ -617,8 +798,7 @@ async def abcex_get_order_history_panel(page: Page) -> Locator:
     cnt = await panel.count()
     if cnt == 0:
         await abcex_save_debug(page, "abcex_no_panel.html", "abcex_no_panel.png")
-        raise RuntimeError("Не нашёл панель panel-orderHistory (см. abcex_no_panel.*).")
-
+        raise RuntimeError("Не нашёл панель panel-orderHistory.")
     for i in range(cnt):
         p = panel.nth(i)
         try:
@@ -626,9 +806,8 @@ async def abcex_get_order_history_panel(page: Page) -> Locator:
                 return p
         except Exception:
             continue
-
     await abcex_save_debug(page, "abcex_no_visible_panel.html", "abcex_no_visible_panel.png")
-    raise RuntimeError("Панель panel-orderHistory найдена, но ни одна не видима.")
+    raise RuntimeError("panel-orderHistory есть, но не видима.")
 
 async def abcex_wait_trades_visible(page: Page, timeout_ms: int = 25_000) -> None:
     start = datetime.utcnow().timestamp()
@@ -730,14 +909,16 @@ def abcex_compute_metrics(trades: List[AbcexTrade]) -> Dict[str, Any]:
     vwap = turnover / sum_qty if sum_qty > 0 else None
     return {"count": len(trades), "sum_qty_usdt": sum_qty, "turnover_quote": turnover, "vwap": vwap}
 
-async def scrape_abcex_trades(
-    email: Optional[str] = None,
-    password: Optional[str] = None,
-    headless: bool = True,
-) -> Dict[str, Any]:
+async def scrape_abcex_trades(headless: bool = True) -> Dict[str, Any]:
+    email = os.getenv("ABCEX_EMAIL")
+    password = os.getenv("ABCEX_PASSWORD")
+    if not email or not password:
+        raise RuntimeError("ABCEX_EMAIL/ABCEX_PASSWORD не заданы в env.")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=headless,
+            proxy=_proxy_config(),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -769,16 +950,7 @@ async def scrape_abcex_trades(
 
             await abcex_accept_cookies_if_any(page)
 
-            if email is None:
-                email = os.getenv("ABCEX_EMAIL")
-            if password is None:
-                password = os.getenv("ABCEX_PASSWORD")
-
-            if await abcex_is_login_visible(page):
-                if not email or not password:
-                    await abcex_save_debug(page, "abcex_need_credentials.html", "abcex_need_credentials.png")
-                    raise RuntimeError("Нужен логин, но не заданы ABCEX_EMAIL/ABCEX_PASSWORD.")
-                await abcex_login_if_needed(page, email=email, password=password)
+            await abcex_login_if_needed(page, email=email, password=password)
 
             try:
                 await context.storage_state(path=STATE_PATH)
@@ -788,9 +960,10 @@ async def scrape_abcex_trades(
 
             await abcex_click_trades_tab_best_effort(page)
             await abcex_wait_trades_visible(page)
-            panel = await abcex_get_order_history_panel(page)
 
+            panel = await abcex_get_order_history_panel(page)
             trades = await abcex_extract_trades_from_panel(panel, limit=MAX_TRADES)
+
             if not trades:
                 await abcex_save_debug(page, "abcex_debug_no_trades_parsed.html", "abcex_debug_no_trades_parsed.png")
                 raise RuntimeError("panel-orderHistory найдена, но сделки не распарсились.")
@@ -801,8 +974,8 @@ async def scrape_abcex_trades(
                 "exchange": "abcex",
                 "symbol": "USDT/RUB",
                 "url": ABCEX_URL,
-                **metrics,
                 "quote_ccy": "RUB",
+                **metrics,
                 "trades": [
                     {
                         "price": t.price,
@@ -831,7 +1004,7 @@ async def scrape_abcex_trades(
                 pass
 
 # ============================================================
-#  UNIFIED LOOP
+# Unified loop
 # ============================================================
 
 def pack_ok(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -841,10 +1014,6 @@ def pack_err(exchange: str, err: Exception) -> Dict[str, Any]:
     return {"ok": False, "error": f"{type(err).__name__}: {err}", "data": {"exchange": exchange}}
 
 def compare_block(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Сравнение оборотов/объёмов. Предполагаем, что quote ~ RUB/A7A5 и сравнение уместно.
-    Если хочешь строго — сравнивай по sum_qty_usdt.
-    """
     rows = []
     for r in results:
         if not r.get("ok"):
@@ -873,21 +1042,21 @@ def compare_block(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 async def run_one_cycle() -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
 
-    # 1) Grinex
+    # Grinex
     try:
-        g = await fetch_grinex_trades_once()
+        g = await fetch_grinex_once()
         results.append(pack_ok(g))
     except Exception as e:
         results.append(pack_err("grinex", e))
 
-    # 2) Rapira
+    # Rapira
     try:
         r = await scrape_rapira_trades(limit=LIMIT)
         results.append(pack_ok(r))
     except Exception as e:
         results.append(pack_err("rapira", e))
 
-    # 3) ABCEX
+    # ABCEX
     try:
         headless = os.getenv("ABCEX_HEADLESS", "1").strip() not in ("0", "false", "False")
         a = await scrape_abcex_trades(headless=headless)
@@ -895,30 +1064,21 @@ async def run_one_cycle() -> Dict[str, Any]:
     except Exception as e:
         results.append(pack_err("abcex", e))
 
-    summary = {
+    return {
         "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "poll_sec": POLL_SEC,
         "limit": LIMIT,
         "results": results,
         "compare": compare_block(results),
     }
-    return summary
 
 async def main() -> None:
     log.info("Starting unified 3-exchange scraper ...")
-
-    # ВАЖНО: один раз на старте
     ensure_playwright_browsers()
 
     while True:
-        try:
-            summary = await run_one_cycle()
-            # Печатаем JSON одной строкой (удобно для логов и парсинга)
-            print(json.dumps(summary, ensure_ascii=False))
-        except Exception as e:
-            # чтобы цикл не умирал
-            log.warning("Cycle failed: %s", e)
-
+        summary = await run_one_cycle()
+        print(json.dumps(summary, ensure_ascii=False))
         await asyncio.sleep(POLL_SEC)
 
 if __name__ == "__main__":
