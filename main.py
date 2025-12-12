@@ -62,9 +62,9 @@ def parse_float(text: str) -> Optional[float]:
         return None
 
 
-def is_captcha_page(html: str) -> bool:
+def is_grinex_captcha_page(html: str) -> bool:
     """
-    Эвристика: страница с rotated-captcha вместо торгового интерфейса.
+    Эвристика: страница с rotated-captcha от Grinex, а не реальный терминал.
     """
     markers = [
         "sp_rotated_captcha",
@@ -75,13 +75,29 @@ def is_captcha_page(html: str) -> bool:
     return any(m in html for m in markers)
 
 
+def is_servicepipe_antibot_page(html: str) -> bool:
+    """
+    Эвристика: страница от servicepipe.ru (JS-антибот / checkjs),
+    через которую нас не пускают к реальному контенту.
+    """
+    markers = [
+        "servicepipe.ru/static/checkjs",
+        "servicepipe.ru/static/jsrsasign-all-min.js",
+        "id_captcha_frame_div",
+        "id_spinner",
+        "cookie_domain\":\"grinex.io",
+    ]
+    return any(m in html for m in markers)
+
+
 # ─────────────── ПАРСИНГ ПОСЛЕДНИХ СДЕЛОК ───────────
 async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
     """
     Пытаемся открыть https://grinex.io/trading/usdta7a5 и вытащить
     последние сделки из таблицы "Последние сделки".
 
-    Если попадаем на страницу с капчей – логируем это и возвращаем [].
+    Если попадаем на защитные промежуточные страницы (капча / servicepipe),
+    честно логируем и возвращаем [].
     """
     async with async_playwright() as p:
         logger.info("Launching Chromium with proxy ...")
@@ -114,8 +130,17 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
         snippet = html[:4000].replace("\n", "")
         logger.info("HTML snippet (first 4000 chars): %s", snippet)
 
-        # Проверяем на капчу
-        if is_captcha_page(html):
+        # 1) Защита servicepipe / checkjs
+        if is_servicepipe_antibot_page(html):
+            logger.warning(
+                "Request is being handled by servicepipe anti-bot page. "
+                "Real Grinex trading interface is not accessible from this environment."
+            )
+            await browser.close()
+            return []
+
+        # 2) Страница Grinex с rotated-captcha
+        if is_grinex_captcha_page(html):
             logger.warning(
                 "Looks like Grinex returned rotated-captcha page. "
                 "Real trading interface is not accessible, cannot read last trades."
@@ -123,7 +148,7 @@ async def fetch_grinex_last_trades() -> List[Dict[str, Any]]:
             await browser.close()
             return []
 
-        # Пытаемся найти таблицу последних сделок
+        # 3) Пытаемся найти таблицу последних сделок на нормальной странице
         rows_locator = page.locator("table.all-trades.usdta7a5 tbody tr[id^='market-trade-']")
 
         rows_count = await rows_locator.count()
@@ -189,7 +214,10 @@ async def main() -> None:
         "trades": trades,
     }
 
-    logger.info("Grinex last trades snapshot:\n%s", json.dumps(result, ensure_ascii=False, indent=2))
+    logger.info(
+        "Grinex last trades snapshot:\n%s",
+        json.dumps(result, ensure_ascii=False, indent=2),
+    )
 
 
 if __name__ == "__main__":
