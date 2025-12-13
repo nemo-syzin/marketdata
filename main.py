@@ -14,6 +14,7 @@ from playwright.async_api import async_playwright, Page
 
 RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
+SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 LIMIT = int(os.getenv("LIMIT", "20"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -227,8 +228,8 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
 async def parse_trades(rows: List[Any], limit: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Возвращает:
-      - rows_for_output: с volume_rub (для логов/print)
-      - rows_for_db: без volume_rub (чтобы generated column не ломался)
+      - rows_for_output: для логов/print (с volume_rub)
+      - rows_for_db: для БД (ТОЖЕ с volume_rub, потому что в БД NOT NULL)
     """
     out: List[Dict[str, Any]] = []
     db_rows: List[Dict[str, Any]] = []
@@ -244,28 +245,21 @@ async def parse_trades(rows: List[Any], limit: int) -> Tuple[List[Dict[str, Any]
         price, volume_usdt, trade_time = parsed
         volume_rub = price * volume_usdt
 
-        # округление
         price2 = round_money(price, 2)
         volu2 = round_money(volume_usdt, 2)
         rub2 = round_money(volume_rub, 2)
 
-        row_out = {
+        row_payload = {
             "source": SOURCE,
+            "symbol": SYMBOL,
             "price": float(price2),
             "volume_usdt": float(volu2),
-            "volume_rub": float(rub2),  # показываем, но в БД не отправляем
-            SUPABASE_TIME_COLUMN: trade_time,
+            "volume_rub": float(rub2),
+            SUPABASE_TIME_COLUMN: trade_time,  # у тебя time without tz -> "HH:MM:SS" ок
         }
 
-        row_db = {
-            "source": SOURCE,
-            "price": float(price2),
-            "volume_usdt": float(volu2),
-            SUPABASE_TIME_COLUMN: trade_time,
-        }
-
-        out.append(row_out)
-        db_rows.append(row_db)
+        out.append(dict(row_payload))
+        db_rows.append(dict(row_payload))
 
     return out, db_rows
 
@@ -280,20 +274,31 @@ async def supabase_insert(rows_for_db: List[Dict[str, Any]]) -> None:
         logger.warning("SUPABASE_URL or SUPABASE_KEY not set; skipping insert.")
         return
 
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    # Важно: игнорируем дубли по твоему unique index (source,symbol,trade_time,price,volume_usdt)
+    on_conflict = "source,symbol,trade_time,price,volume_usdt"
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict={on_conflict}"
+
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
+        # ключевое: дубли не считаем ошибкой
+        "Prefer": "resolution=ignore-duplicates,return=minimal",
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json=rows_for_db)
-        if r.status_code >= 300:
-            logger.error("Supabase insert failed (%s): %s", r.status_code, r.text)
-        else:
-            logger.info("Inserted %d rows into '%s'.", len(rows_for_db), SUPABASE_TABLE)
+
+        if r.status_code in (200, 201, 204):
+            logger.info("Inserted %d rows into '%s' (duplicates ignored).", len(rows_for_db), SUPABASE_TABLE)
+            return
+
+        # если вдруг PostgREST всё равно вернул конфликт — не валим логи как ERROR
+        if r.status_code == 409:
+            logger.warning("Duplicates conflict (409). Most likely same trades already exist. Response: %s", r.text)
+            return
+
+        logger.error("Supabase insert failed (%s): %s", r.status_code, r.text)
 
 
 # ───────────────────────── SCRAPER ─────────────────────────
@@ -328,15 +333,15 @@ async def scrape_rapira() -> Dict[str, Any]:
             await page.wait_for_timeout(1_500)
 
             rows = await wait_trade_rows(page, max_wait_seconds=40)
-
             rows_for_output, rows_for_db = await parse_trades(rows, limit=LIMIT)
 
             return {
                 "ok": True,
                 "source": SOURCE,
+                "symbol": SYMBOL,
                 "count": len(rows_for_output),
                 "rows": rows_for_output,
-                "_rows_for_db": rows_for_db,  # внутреннее — для вставки
+                "_rows_for_db": rows_for_db,
             }
         finally:
             try:
@@ -350,11 +355,9 @@ async def scrape_rapira() -> Dict[str, Any]:
 async def main() -> None:
     result = await scrape_rapira()
 
-    # insert
     if result.get("ok") and result.get("_rows_for_db"):
         await supabase_insert(result["_rows_for_db"])
 
-    # печать (без внутреннего поля)
     result.pop("_rows_for_db", None)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
