@@ -4,36 +4,66 @@ import logging
 import os
 import re
 import subprocess
+from collections import deque
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
 RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
-LIMIT = int(os.getenv("LIMIT", "20"))
+
+LIMIT = int(os.getenv("LIMIT", "50"))
+POLL_SEC = float(os.getenv("POLL_SEC", "3"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+# поддержим оба варианта имени ключа (как у тебя в Render)
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_KEY", "").strip()
+    or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+)
+
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# Имя колонки времени в Supabase
+# Имя колонки времени в Supabase (у тебя trade_time)
 SUPABASE_TIME_COLUMN = os.getenv("SUPABASE_TIME_COLUMN", "trade_time")
 
+# Колонки уникального ключа (должно совпадать с dedupe-unique index/constraint)
+# exchange_trades_dedupe_uq: (source, symbol, trade_time, price, volume_usdt)
+ON_CONFLICT = os.getenv(
+    "ON_CONFLICT",
+    "source,symbol,trade_time,price,volume_usdt"
+)
+
+# Если браузер ставится на build-стадии — ставь 1, чтобы не тратить время на каждом запуске
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
+
+# Какой таймзоной “живёт” сайт (для корректного отображения/локали)
+TIMEZONE_ID = os.getenv("TIMEZONE_ID", "Europe/Moscow")
+LOCALE = os.getenv("LOCALE", "ru-RU")
+
+# Память дедупликации в процессе (чтобы меньше долбить Supabase одинаковыми пачками)
+SEEN_MAX = int(os.getenv("SEEN_MAX", "5000"))
+
+# ───────────────────────── LOGGING ─────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
 )
-logger = logging.getLogger("rapira-last-trades")
+logger = logging.getLogger("rapira-worker")
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
 
+TRADE_ROWS_SELECTOR = (
+    "div.table-responsive.table-orders "
+    "table.table-row-dashed tbody tr.table-orders-row"
+)
 
 # ───────────────────────── PLAYWRIGHT INSTALL ─────────────────────────
 
@@ -64,7 +94,6 @@ def ensure_playwright_browsers() -> None:
     except Exception as e:
         logger.error("Unexpected error while installing Playwright browsers: %s", e)
 
-
 # ───────────────────────── NORMALIZERS ─────────────────────────
 
 def normalize_decimal(text: str) -> Optional[Decimal]:
@@ -81,7 +110,6 @@ def normalize_decimal(text: str) -> Optional[Decimal]:
     except (InvalidOperation, ValueError):
         return None
 
-
 def extract_time(text: str) -> Optional[str]:
     """
     Вытаскивает время HH:MM:SS из текста.
@@ -95,11 +123,9 @@ def extract_time(text: str) -> Optional[str]:
         hh = "0" + hh
     return f"{hh}:{mm}:{ss}"
 
-
 def round_money(x: Decimal, ndigits: int) -> Decimal:
     q = Decimal("1").scaleb(-ndigits)  # 10^-ndigits
     return x.quantize(q, rounding=ROUND_HALF_UP)
-
 
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
@@ -115,7 +141,6 @@ async def accept_cookies_if_any(page: Page) -> None:
         except Exception:
             pass
 
-
 async def ensure_last_trades_tab(page: Page) -> None:
     for label in ["Последние сделки", "История сделок", "История"]:
         try:
@@ -129,30 +154,18 @@ async def ensure_last_trades_tab(page: Page) -> None:
             pass
     logger.info("Trades tab not clicked explicitly (maybe already active).")
 
-
-# ───────────────────────── PARSING ─────────────────────────
-
-TRADE_ROWS_SELECTOR = (
-    "div.table-responsive.table-orders "
-    "table.table-row-dashed tbody tr.table-orders-row"
-)
-
 async def wait_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[Any]:
     for i in range(max_wait_seconds):
         try:
             rows = await page.query_selector_all(TRADE_ROWS_SELECTOR)
             if rows:
-                logger.info("Found %d rows using selector '%s'.", len(rows), TRADE_ROWS_SELECTOR)
                 return rows
         except Exception:
             pass
-
-        logger.info("No rows yet (attempt %d/%d), waiting 1s...", i + 1, max_wait_seconds)
         await page.wait_for_timeout(1_000)
-
-    logger.warning("No trade rows found.")
     return []
 
+# ───────────────────────── PARSING ─────────────────────────
 
 async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
     """
@@ -224,15 +237,14 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
     except Exception:
         return None
 
+def make_dedupe_key(source: str, symbol: str, trade_time: str, price: Decimal, volume_usdt: Decimal) -> str:
+    # нормализуем к 8 знакам, как в БД numeric(18,8)
+    p = round_money(price, 8)
+    v = round_money(volume_usdt, 8)
+    return f"{source}|{symbol}|{trade_time}|{p}|{v}"
 
-async def parse_trades(rows: List[Any], limit: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Возвращает:
-      - rows_for_output: для логов/print (с volume_rub)
-      - rows_for_db: для БД (ТОЖЕ с volume_rub, потому что в БД NOT NULL)
-    """
+async def parse_trades(rows: List[Any], limit: int, seen: deque) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    db_rows: List[Dict[str, Any]] = []
 
     for row in rows:
         if len(out) >= limit:
@@ -243,124 +255,197 @@ async def parse_trades(rows: List[Any], limit: int) -> Tuple[List[Dict[str, Any]
             continue
 
         price, volume_usdt, trade_time = parsed
+
+        # дедупликация на уровне процесса (чтобы меньше дергать Supabase)
+        key = make_dedupe_key(SOURCE, SYMBOL, trade_time, price, volume_usdt)
+        if key in seen:
+            continue
+
         volume_rub = price * volume_usdt
 
-        price2 = round_money(price, 2)
-        volu2 = round_money(volume_usdt, 2)
-        rub2 = round_money(volume_rub, 2)
+        # округление (в БД 8 знаков — отправим 8, а не float-2)
+        price8 = round_money(price, 8)
+        volu8 = round_money(volume_usdt, 8)
+        rub8 = round_money(volume_rub, 8)
 
-        row_payload = {
-            "source": SOURCE,
-            "symbol": SYMBOL,
-            "price": float(price2),
-            "volume_usdt": float(volu2),
-            "volume_rub": float(rub2),
-            SUPABASE_TIME_COLUMN: trade_time,  # у тебя time without tz -> "HH:MM:SS" ок
-        }
+        out.append(
+            {
+                "source": SOURCE,
+                "symbol": SYMBOL,
+                "price": str(price8),         # лучше строкой, чтобы не терять точность
+                "volume_usdt": str(volu8),
+                "volume_rub": str(rub8),
+                SUPABASE_TIME_COLUMN: trade_time,  # time without time zone
+            }
+        )
 
-        out.append(dict(row_payload))
-        db_rows.append(dict(row_payload))
+        seen.append(key)
 
-    return out, db_rows
-
+    return out
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
-async def supabase_insert(rows_for_db: List[Dict[str, Any]]) -> None:
-    if not rows_for_db:
-        logger.info("No rows to insert.")
+async def supabase_insert(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        logger.info("No new rows to insert.")
         return
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.warning("SUPABASE_URL or SUPABASE_KEY not set; skipping insert.")
         return
 
-    # Важно: игнорируем дубли по твоему unique index (source,symbol,trade_time,price,volume_usdt)
-    on_conflict = "source,symbol,trade_time,price,volume_usdt"
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict={on_conflict}"
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    params = {"on_conflict": ON_CONFLICT}
 
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        # ключевое: дубли не считаем ошибкой
-        "Prefer": "resolution=ignore-duplicates,return=minimal",
+        # важно: игнорировать дубликаты по on_conflict
+        "Prefer": "return=minimal,resolution=ignore-duplicates",
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=rows_for_db)
+        r = await client.post(url, headers=headers, params=params, json=rows)
 
+        # 201/204 — ок
         if r.status_code in (200, 201, 204):
-            logger.info("Inserted %d rows into '%s' (duplicates ignored).", len(rows_for_db), SUPABASE_TABLE)
+            logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
             return
 
-        # если вдруг PostgREST всё равно вернул конфликт — не валим логи как ERROR
+        # если Supabase всё равно вернул 409 — считаем допустимым (дубликаты)
         if r.status_code == 409:
-            logger.warning("Duplicates conflict (409). Most likely same trades already exist. Response: %s", r.text)
+            logger.info("Supabase returned 409 (duplicates). Treat as OK. Body: %s", r.text)
             return
 
         logger.error("Supabase insert failed (%s): %s", r.status_code, r.text)
 
+# ───────────────────────── WORKER LOOP ─────────────────────────
 
-# ───────────────────────── SCRAPER ─────────────────────────
+@dataclass
+class BrowserBundle:
+    browser: Browser
+    context: BrowserContext
+    page: Page
 
-async def scrape_rapira() -> Dict[str, Any]:
+async def open_browser() -> BrowserBundle:
+    p = await async_playwright().start()
+
+    browser = await p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+
+    context = await browser.new_context(
+        viewport={"width": 1440, "height": 810},
+        locale=LOCALE,
+        timezone_id=TIMEZONE_ID,
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+
+    page = await context.new_page()
+
+    # сохраним ссылку на playwright, чтобы корректно закрыть
+    page._pw = p  # type: ignore[attr-defined]
+    return BrowserBundle(browser=browser, context=context, page=page)
+
+async def close_browser(bundle: BrowserBundle) -> None:
+    try:
+        await bundle.page.close()
+    except Exception:
+        pass
+    try:
+        await bundle.context.close()
+    except Exception:
+        pass
+    try:
+        await bundle.browser.close()
+    except Exception:
+        pass
+    try:
+        p = getattr(bundle.page, "_pw", None)
+        if p:
+            await p.stop()
+    except Exception:
+        pass
+
+async def ensure_page_ready(page: Page) -> None:
+    logger.info("Opening Rapira page %s ...", RAPIRA_URL)
+    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    await page.wait_for_timeout(2_000)
+    await accept_cookies_if_any(page)
+    await ensure_last_trades_tab(page)
+    await page.wait_for_timeout(1_000)
+
+async def worker_loop() -> None:
     ensure_playwright_browsers()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1440, "height": 810},
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
+    seen = deque(maxlen=SEEN_MAX)
+    bundle: Optional[BrowserBundle] = None
 
-        page = await context.new_page()
+    backoff = 2.0
+    backoff_max = 60.0
+
+    while True:
         try:
-            logger.info("Opening Rapira page %s ...", RAPIRA_URL)
-            await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-            await page.wait_for_timeout(2_500)
+            if bundle is None:
+                bundle = await open_browser()
+                await ensure_page_ready(bundle.page)
+                backoff = 2.0
 
-            await accept_cookies_if_any(page)
-            await ensure_last_trades_tab(page)
-            await page.wait_for_timeout(1_500)
-
-            rows = await wait_trade_rows(page, max_wait_seconds=40)
-            rows_for_output, rows_for_db = await parse_trades(rows, limit=LIMIT)
-
-            return {
-                "ok": True,
-                "source": SOURCE,
-                "symbol": SYMBOL,
-                "count": len(rows_for_output),
-                "rows": rows_for_output,
-                "_rows_for_db": rows_for_db,
-            }
-        finally:
+            # мягкий refresh, чтобы таблица точно обновлялась
             try:
-                await page.close()
+                await bundle.page.reload(wait_until="domcontentloaded", timeout=60_000)
+                await bundle.page.wait_for_timeout(1_000)
+                await accept_cookies_if_any(bundle.page)
+                await ensure_last_trades_tab(bundle.page)
+                await bundle.page.wait_for_timeout(800)
             except Exception:
-                pass
-            await context.close()
-            await browser.close()
+                # если reload сломался — пересоздадим браузер
+                raise
 
+            rows = await wait_trade_rows(bundle.page, max_wait_seconds=20)
+            if not rows:
+                logger.warning("No trade rows found this iteration.")
+                await asyncio.sleep(POLL_SEC)
+                continue
 
-async def main() -> None:
-    result = await scrape_rapira()
+            trades = await parse_trades(rows, limit=LIMIT, seen=seen)
 
-    if result.get("ok") and result.get("_rows_for_db"):
-        await supabase_insert(result["_rows_for_db"])
+            # лог для контроля
+            if trades:
+                logger.info("Parsed %d new trades. First: %s", len(trades), json.dumps(trades[0], ensure_ascii=False))
+            else:
+                logger.info("No new trades after dedupe.")
 
-    result.pop("_rows_for_db", None)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+            await supabase_insert(trades)
 
+            await asyncio.sleep(POLL_SEC)
+
+        except asyncio.CancelledError:
+            logger.info("Worker cancelled, shutting down.")
+            break
+
+        except Exception as e:
+            logger.error("Worker error: %s", e)
+
+            # пересоздаём браузер на любой серьёзной ошибке
+            if bundle is not None:
+                await close_browser(bundle)
+                bundle = None
+
+            logger.info("Retrying after %.1fs ...", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, backoff_max)
+
+    if bundle is not None:
+        await close_browser(bundle)
+
+def main() -> None:
+    asyncio.run(worker_loop())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
