@@ -20,7 +20,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# Имя колонки времени в Supabase (сделай как у тебя реально в БД)
+# Имя колонки времени в Supabase
 SUPABASE_TIME_COLUMN = os.getenv("SUPABASE_TIME_COLUMN", "trade_time")
 
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
@@ -89,7 +89,6 @@ def extract_time(text: str) -> Optional[str]:
     if not m:
         return None
     s = m.group(0)
-    # нормализуем 1:02:03 -> 01:02:03
     hh, mm, ss = s.split(":")
     if len(hh) == 1:
         hh = "0" + hh
@@ -117,7 +116,6 @@ async def accept_cookies_if_any(page: Page) -> None:
 
 
 async def ensure_last_trades_tab(page: Page) -> None:
-    # Вкладка справа над таблицей
     for label in ["Последние сделки", "История сделок", "История"]:
         try:
             tab = page.locator(f"text={label}")
@@ -158,11 +156,6 @@ async def wait_trade_rows(page: Page, max_wait_seconds: int = 40) -> List[Any]:
 async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
     """
     Возвращает (price, volume_usdt, trade_time) или None.
-    Стратегия:
-      - вытаскиваем тексты всех td
-      - время ищем regex HH:MM:SS
-      - price берём из td.text-success (как на скрине) или по эвристике
-      - volume_usdt — оставшееся число
     """
     try:
         tds = await row.query_selector_all("td")
@@ -170,6 +163,8 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
             return None
 
         td_texts = [(await td.inner_text()).strip() for td in tds]
+
+        # 1) время
         trade_time = None
         time_idx = None
         for idx, txt in enumerate(td_texts):
@@ -178,11 +173,10 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
                 trade_time = t
                 time_idx = idx
                 break
-
         if not trade_time:
             return None
 
-        # price: пробуем найти td.text-success (на скрине так)
+        # 2) price: пробуем td.text-success
         price: Optional[Decimal] = None
         try:
             price_td = await row.query_selector("td.text-success")
@@ -192,38 +186,35 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
         except Exception:
             pass
 
-        # Если не нашли по классу — эвристика: число 40..200
-        nums: List[Tuple[int, Decimal]] = []
+        # 3) все числа (кроме времени)
+        nums: List[Decimal] = []
         for idx, txt in enumerate(td_texts):
             if idx == time_idx:
                 continue
             n = normalize_decimal(txt)
             if n is not None:
-                nums.append((idx, n))
+                nums.append(n)
 
-        if not nums or len(nums) < 2:
+        if len(nums) < 2:
             return None
 
+        # 4) если price не нашли — эвристика 40..200
         if price is None:
-            for _, n in nums:
+            for n in nums:
                 if Decimal("40") <= n <= Decimal("200"):
                     price = n
                     break
-
         if price is None:
-            # fallback — первое число
-            price = nums[0][1]
+            price = nums[0]
 
-        # volume_usdt: берём число, которое не price и не time
-        # (в таблице обычно один remaining numeric)
+        # 5) volume_usdt — любое другое число (не price)
         volume_usdt: Optional[Decimal] = None
-        for _, n in nums:
+        for n in nums:
             if n != price:
                 volume_usdt = n
                 break
         if volume_usdt is None:
-            # если вдруг price == volume по значению (редко), берём второй элемент
-            volume_usdt = nums[1][1]
+            volume_usdt = nums[1]
 
         if price <= 0 or volume_usdt <= 0:
             return None
@@ -233,8 +224,14 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
         return None
 
 
-async def parse_trades(rows: List[Any], limit: int) -> List[Dict[str, Any]]:
+async def parse_trades(rows: List[Any], limit: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Возвращает:
+      - rows_for_output: с volume_rub (для логов/print)
+      - rows_for_db: без volume_rub (чтобы generated column не ломался)
+    """
     out: List[Dict[str, Any]] = []
+    db_rows: List[Dict[str, Any]] = []
 
     for row in rows:
         if len(out) >= limit:
@@ -247,31 +244,36 @@ async def parse_trades(rows: List[Any], limit: int) -> List[Dict[str, Any]]:
         price, volume_usdt, trade_time = parsed
         volume_rub = price * volume_usdt
 
-        # Рекомендую:
-        # - price: 2 знака
-        # - volume_usdt: 2 знака (можно 4/8 — как хочешь)
-        # - volume_rub: 2 знака
+        # округление
         price2 = round_money(price, 2)
         volu2 = round_money(volume_usdt, 2)
         rub2 = round_money(volume_rub, 2)
 
-        out.append(
-            {
-                "source": SOURCE,
-                "price": float(price2),
-                "volume_usdt": float(volu2),
-                "volume_rub": float(rub2),
-                SUPABASE_TIME_COLUMN: trade_time,
-            }
-        )
+        row_out = {
+            "source": SOURCE,
+            "price": float(price2),
+            "volume_usdt": float(volu2),
+            "volume_rub": float(rub2),  # показываем, но в БД не отправляем
+            SUPABASE_TIME_COLUMN: trade_time,
+        }
 
-    return out
+        row_db = {
+            "source": SOURCE,
+            "price": float(price2),
+            "volume_usdt": float(volu2),
+            SUPABASE_TIME_COLUMN: trade_time,
+        }
+
+        out.append(row_out)
+        db_rows.append(row_db)
+
+    return out, db_rows
 
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
-async def supabase_insert(rows: List[Dict[str, Any]]) -> None:
-    if not rows:
+async def supabase_insert(rows_for_db: List[Dict[str, Any]]) -> None:
+    if not rows_for_db:
         logger.info("No rows to insert.")
         return
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -287,11 +289,11 @@ async def supabase_insert(rows: List[Dict[str, Any]]) -> None:
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=rows)
+        r = await client.post(url, headers=headers, json=rows_for_db)
         if r.status_code >= 300:
             logger.error("Supabase insert failed (%s): %s", r.status_code, r.text)
         else:
-            logger.info("Inserted %d rows into '%s'.", len(rows), SUPABASE_TABLE)
+            logger.info("Inserted %d rows into '%s'.", len(rows_for_db), SUPABASE_TABLE)
 
 
 # ───────────────────────── SCRAPER ─────────────────────────
@@ -323,18 +325,18 @@ async def scrape_rapira() -> Dict[str, Any]:
 
             await accept_cookies_if_any(page)
             await ensure_last_trades_tab(page)
-
-            # даём таблице прогрузиться
             await page.wait_for_timeout(1_500)
 
             rows = await wait_trade_rows(page, max_wait_seconds=40)
-            trades = await parse_trades(rows, limit=LIMIT)
+
+            rows_for_output, rows_for_db = await parse_trades(rows, limit=LIMIT)
 
             return {
                 "ok": True,
                 "source": SOURCE,
-                "count": len(trades),
-                "rows": trades,
+                "count": len(rows_for_output),
+                "rows": rows_for_output,
+                "_rows_for_db": rows_for_db,  # внутреннее — для вставки
             }
         finally:
             try:
@@ -349,9 +351,11 @@ async def main() -> None:
     result = await scrape_rapira()
 
     # insert
-    if result.get("ok") and result.get("rows"):
-        await supabase_insert(result["rows"])
+    if result.get("ok") and result.get("_rows_for_db"):
+        await supabase_insert(result["_rows_for_db"])
 
+    # печать (без внутреннего поля)
+    result.pop("_rows_for_db", None)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
