@@ -19,21 +19,24 @@ RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
-# Сколько строк брать с UI за один проход (должно быть с запасом!)
-LIMIT = int(os.getenv("LIMIT", "200"))
+# Бери с запасом: чем выше LIMIT, тем меньше шанс пропуска между циклами
+LIMIT = int(os.getenv("LIMIT", "500"))
 
-# Как часто опрашивать (сек). Чем меньше — тем меньше шанс пропусков.
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2.0"))
+# Частота опроса (сек): меньше -> меньше шанс пропусков
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.0"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# Конфликт-ключ должен совпадать с твоим unique index
+# Должно совпадать с unique index
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
-# Playwright install в рантайме (можно отключить, если ставишь в Build Command)
-SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
+# Если ставишь браузер на build step — ставь SKIP_BROWSER_INSTALL=1
+SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "1") == "1"
+
+# Если Render/Playwright иногда “отваливается”, можно включить периодические reload
+MAX_NO_NEW_STREAK = int(os.getenv("MAX_NO_NEW_STREAK", "120"))  # ~120 секунд при POLL=1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,18 +45,21 @@ logging.basicConfig(
 logger = logging.getLogger("rapira-worker")
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
+Q8 = Decimal("0.00000001")  # под numeric(18,8)
 
-# Точность под numeric(18,8)
-Q8 = Decimal("0.00000001")
-
+# Селектор строк таблицы "Последние сделки"
+TRADE_ROWS_SELECTOR = (
+    "div.table-responsive.table-orders "
+    "table.table-row-dashed tbody tr.table-orders-row"
+)
 
 # ───────────────────────── HELPERS ─────────────────────────
 
 def ensure_playwright_browsers() -> None:
     """
-    На Render надежнее ставить браузер на build step:
-      pip install -r requirements.txt && playwright install chromium --with-deps
-    Но этот runtime-установщик тоже работает (медленнее).
+    На Render надёжнее ставить браузер в Build Command:
+      playwright install chromium --with-deps
+    Тогда в рантайме ставь SKIP_BROWSER_INSTALL=1.
     """
     if SKIP_BROWSER_INSTALL:
         logger.info("SKIP_BROWSER_INSTALL=1, skipping playwright install.")
@@ -62,7 +68,7 @@ def ensure_playwright_browsers() -> None:
     try:
         logger.info("Ensuring Playwright Chromium is installed ...")
         result = subprocess.run(
-            ["playwright", "install", "chromium"],
+            ["playwright", "install", "chromium", "--with-deps"],
             check=False,
             capture_output=True,
             text=True,
@@ -118,44 +124,47 @@ class TradeKey:
     volume_usdt: str
 
 
+def trade_key(t: Dict[str, Any]) -> TradeKey:
+    return TradeKey(
+        source=t["source"],
+        symbol=t["symbol"],
+        trade_time=t["trade_time"],
+        price=t["price"],
+        volume_usdt=t["volume_usdt"],
+    )
+
+
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
     for label in ["Я согласен", "Принять", "Accept"]:
         try:
-            btn = page.locator(f"text={label}")
+            btn = page.get_by_text(label, exact=True)
             if await btn.count() > 0:
                 logger.info("Found cookies banner, clicking '%s'...", label)
                 await btn.first.click(timeout=5_000)
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(250)
                 return
         except Exception:
             pass
 
 
 async def ensure_last_trades_tab(page: Page) -> None:
-    for label in ["Последние сделки", "История сделок", "История"]:
-        try:
-            tab = page.locator(f"text={label}")
-            if await tab.count() > 0:
-                logger.info("Clicking tab '%s' ...", label)
-                await tab.first.click(timeout=5_000)
-                await page.wait_for_timeout(500)
-                return
-        except Exception:
-            pass
-    logger.info("Trades tab not clicked explicitly (maybe already active).")
+    """
+    ВАЖНО: кликаем только 'Последние сделки' (exact),
+    чтобы НЕ уводило в 'История/История сделок'.
+    """
+    tab = page.get_by_text("Последние сделки", exact=True)
+    if await tab.count() == 0:
+        raise RuntimeError("Tab 'Последние сделки' not found (DOM changed or page not ready).")
+
+    await tab.first.click(timeout=5_000)
+    await page.wait_for_timeout(250)
+    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=15_000)
 
 
-# ───────────────────────── PARSING ─────────────────────────
-
-TRADE_ROWS_SELECTOR = (
-    "div.table-responsive.table-orders "
-    "table.table-row-dashed tbody tr.table-orders-row"
-)
-
-async def wait_trade_rows(page: Page, max_wait_seconds: int = 30) -> List[Any]:
-    for i in range(max_wait_seconds):
+async def wait_trade_rows(page: Page, max_wait_seconds: int = 20) -> List[Any]:
+    for _ in range(max_wait_seconds):
         try:
             rows = await page.query_selector_all(TRADE_ROWS_SELECTOR)
             if rows:
@@ -166,9 +175,12 @@ async def wait_trade_rows(page: Page, max_wait_seconds: int = 30) -> List[Any]:
     return []
 
 
+# ───────────────────────── PARSING ─────────────────────────
+
 async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
     """
     Возвращает (price, volume_usdt, trade_time) или None.
+    Работает по эвристике, потому что у Rapira верстка может меняться.
     """
     try:
         tds = await row.query_selector_all("td")
@@ -177,7 +189,7 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
 
         td_texts = [(await td.inner_text()).strip() for td in tds]
 
-        # 1) время
+        # trade_time
         trade_time = None
         time_idx = None
         for idx, txt in enumerate(td_texts):
@@ -189,7 +201,7 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
         if not trade_time:
             return None
 
-        # 2) цена — пробуем td.text-success
+        # price: пробуем td.text-success (часто цена подсвечена)
         price: Optional[Decimal] = None
         try:
             price_td = await row.query_selector("td.text-success")
@@ -199,7 +211,7 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
         except Exception:
             pass
 
-        # 3) все числа (кроме времени)
+        # собираем числа (кроме времени)
         nums: List[Decimal] = []
         for idx, txt in enumerate(td_texts):
             if idx == time_idx:
@@ -211,7 +223,7 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
         if len(nums) < 2:
             return None
 
-        # 4) если price не нашли — эвристика 40..200
+        # если price не нашли — берём “похожее на курс” 40..200, иначе первое
         if price is None:
             for n in nums:
                 if Decimal("40") <= n <= Decimal("200"):
@@ -220,8 +232,8 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
         if price is None:
             price = nums[0]
 
-        # 5) volume_usdt — другое число
-        volume_usdt: Optional[Decimal] = None
+        # volume_usdt — другое число (обычно объём)
+        volume_usdt = None
         for n in nums:
             if n != price:
                 volume_usdt = n
@@ -238,7 +250,7 @@ async def parse_row(row: Any) -> Optional[Tuple[Decimal, Decimal, str]]:
 
 
 async def scrape_once(page: Page) -> List[Dict[str, Any]]:
-    rows = await wait_trade_rows(page, max_wait_seconds=30)
+    rows = await wait_trade_rows(page, max_wait_seconds=20)
     if not rows:
         logger.warning("No trade rows found.")
         return []
@@ -252,18 +264,13 @@ async def scrape_once(page: Page) -> List[Dict[str, Any]]:
         price, volume_usdt, trade_time = parsed
         volume_rub = price * volume_usdt
 
-        # В БД отправляем как строки с 8 знаками (точно под numeric(18,8))
-        price_s = q8_str(price)
-        volu_s = q8_str(volume_usdt)
-        rub_s = q8_str(volume_rub)
-
         out.append(
             {
                 "source": SOURCE,
                 "symbol": SYMBOL,
-                "price": price_s,
-                "volume_usdt": volu_s,
-                "volume_rub": rub_s,
+                "price": q8_str(price),
+                "volume_usdt": q8_str(volume_usdt),
+                "volume_rub": q8_str(volume_rub),
                 "trade_time": trade_time,  # time without tz
             }
         )
@@ -271,23 +278,16 @@ async def scrape_once(page: Page) -> List[Dict[str, Any]]:
     return out
 
 
-def trade_key(t: Dict[str, Any]) -> TradeKey:
-    return TradeKey(
-        source=t["source"],
-        symbol=t["symbol"],
-        trade_time=t["trade_time"],
-        price=t["price"],
-        volume_usdt=t["volume_usdt"],
-    )
-
-
-def filter_new_trades(trades: List[Dict[str, Any]], last_seen: Optional[TradeKey]) -> Tuple[List[Dict[str, Any]], Optional[TradeKey], bool]:
+def filter_new_trades(
+    trades: List[Dict[str, Any]],
+    last_seen: Optional[TradeKey],
+) -> Tuple[List[Dict[str, Any]], Optional[TradeKey], bool]:
     """
-    trades: отсортированы как на странице (обычно новые сверху)
+    trades: как на странице (обычно новые сверху)
     Возвращает:
-      - new_trades (в правильном порядке для вставки: старые -> новые)
+      - new_trades (старые -> новые, удобнее вставлять)
       - updated_last_seen (самая новая запись из текущего окна)
-      - gap_detected: last_seen не найден в окне (возможен пропуск)
+      - gap_detected (last_seen не найден -> возможен пропуск)
     """
     if not trades:
         return [], last_seen, False
@@ -296,17 +296,14 @@ def filter_new_trades(trades: List[Dict[str, Any]], last_seen: Optional[TradeKey
     newest = keys[0]
 
     if last_seen is None:
-        # первый запуск: вставим всё окно (от старых к новым)
         return list(reversed(trades)), newest, False
 
-    # ищем last_seen в текущем окне
     try:
         idx = keys.index(last_seen)
-        # всё, что выше idx — новые
         new_part = trades[:idx]
         return list(reversed(new_part)), newest, False
     except ValueError:
-        # last_seen не нашли => окно “уехало”, пропуск возможен
+        # окно уехало — вставим всё окно
         return list(reversed(trades)), newest, True
 
 
@@ -326,7 +323,7 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        # ключевая часть: не падать на unique, а игнорировать дубликаты
+        # НЕ падать на дублях unique index
         "Prefer": "resolution=ignore-duplicates,return=minimal",
     }
 
@@ -338,7 +335,7 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
             logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
 
 
-# ───────────────────────── WORKER LOOP ─────────────────────────
+# ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     browser = await pw.chromium.launch(
@@ -360,15 +357,37 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     await page.wait_for_timeout(1_500)
     await accept_cookies_if_any(page)
     await ensure_last_trades_tab(page)
-    await page.wait_for_timeout(800)
+    await page.wait_for_timeout(300)
     return browser, context, page
 
+
+async def close_browser(browser: Optional[Browser], context: Optional[BrowserContext], page: Optional[Page]) -> None:
+    try:
+        if page:
+            await page.close()
+    except Exception:
+        pass
+    try:
+        if context:
+            await context.close()
+    except Exception:
+        pass
+    try:
+        if browser:
+            await browser.close()
+    except Exception:
+        pass
+
+
+# ───────────────────────── WORKER LOOP ─────────────────────────
 
 async def worker() -> None:
     ensure_playwright_browsers()
 
     last_seen: Optional[TradeKey] = None
     backoff = 2.0
+    no_new_streak = 0
+    gap_streak = 0
 
     async with async_playwright() as pw:
         browser: Optional[Browser] = None
@@ -381,30 +400,59 @@ async def worker() -> None:
                     logger.info("Starting browser session...")
                     browser, context, page = await open_browser(pw)
                     backoff = 2.0
+                    no_new_streak = 0
+                    gap_streak = 0
 
-                # на всякий случай убеждаемся, что вкладка правильная
+                # Жёстко убеждаемся, что мы на нужной вкладке
                 await ensure_last_trades_tab(page)
 
                 trades = await scrape_once(page)
                 new_trades, last_seen_new, gap = filter_new_trades(trades, last_seen)
 
                 if gap:
+                    gap_streak += 1
                     logger.warning(
-                        "Possible gap detected: last_seen not found in current window. "
-                        "Increase LIMIT and/or decrease POLL_SECONDS to reduce misses."
+                        "Possible gap detected (last_seen not found). "
+                        "Increase LIMIT and/or decrease POLL_SECONDS. gap_streak=%d",
+                        gap_streak,
                     )
+                else:
+                    gap_streak = 0
 
                 if new_trades:
-                    first = json.dumps(new_trades[-1], ensure_ascii=False)
-                    logger.info("Parsed %d new trades. Last (newest): %s", len(new_trades), first)
+                    no_new_streak = 0
+                    logger.info(
+                        "Parsed %d new trades. Last (newest): %s",
+                        len(new_trades),
+                        json.dumps(new_trades[-1], ensure_ascii=False),
+                    )
                     await supabase_upsert(new_trades)
                 else:
-                    logger.info("No new trades.")
+                    no_new_streak += 1
+                    logger.info("No new trades. streak=%d", no_new_streak)
 
                 last_seen = last_seen_new
 
-                # небольшой джиттер, чтобы не попадать в строгие интервалы
-                sleep_s = max(0.3, POLL_SECONDS + random.uniform(-0.2, 0.2))
+                # Если долго нет новых — страница могла “залипнуть”
+                if no_new_streak >= MAX_NO_NEW_STREAK:
+                    logger.warning("No new trades for too long; reloading page...")
+                    await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(1_500)
+                    await accept_cookies_if_any(page)
+                    await ensure_last_trades_tab(page)
+                    no_new_streak = 0
+
+                # Если несколько gap подряд — тоже перезагрузка (DOM/таблица могла смениться)
+                if gap_streak >= 3:
+                    logger.warning("Multiple gaps detected; reloading page...")
+                    await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(1_500)
+                    await accept_cookies_if_any(page)
+                    await ensure_last_trades_tab(page)
+                    gap_streak = 0
+
+                # джиттер, чтобы не долбить строго по секундам
+                sleep_s = max(0.2, POLL_SECONDS + random.uniform(-0.15, 0.15))
                 await asyncio.sleep(sleep_s)
 
             except Exception as e:
@@ -413,23 +461,7 @@ async def worker() -> None:
                 await asyncio.sleep(backoff)
                 backoff = min(60.0, backoff * 2)
 
-                # перезапускаем браузерную сессию
-                try:
-                    if page:
-                        await page.close()
-                except Exception:
-                    pass
-                try:
-                    if context:
-                        await context.close()
-                except Exception:
-                    pass
-                try:
-                    if browser:
-                        await browser.close()
-                except Exception:
-                    pass
-
+                await close_browser(browser, context, page)
                 browser = context = page = None
 
 
