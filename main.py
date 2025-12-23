@@ -21,36 +21,27 @@ RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
-# Сколько строк брать с UI за проход (держи с запасом!)
-LIMIT = int(os.getenv("LIMIT", "400"))
+# На Render 400 строк часто слишком медленно. Дефолт уменьшаем.
+LIMIT = int(os.getenv("LIMIT", "150"))
 
-# Как часто опрашивать (сек). Чем меньше — тем меньше шанс пропусков.
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
 
-# Таймауты/стабильность
-SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "25"))   # таймаут на чтение окна
-UPSERT_TIMEOUT_SECONDS = float(os.getenv("UPSERT_TIMEOUT_SECONDS", "25"))   # таймаут на POST в Supabase
-HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "30"))             # лог "живой" даже при тишине
-RELOAD_EVERY_SECONDS = float(os.getenv("RELOAD_EVERY_SECONDS", "600"))      # профилактический reload страницы
+SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "25"))
+UPSERT_TIMEOUT_SECONDS = float(os.getenv("UPSERT_TIMEOUT_SECONDS", "25"))
+HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "30"))
+RELOAD_EVERY_SECONDS = float(os.getenv("RELOAD_EVERY_SECONDS", "600"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# Должно совпадать с unique index:
-# create unique index ... (source, symbol, trade_time, price, volume_usdt)
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
-# Можно оставить, но код сам поставит браузер, если его нет
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 
-# Сколько последних ключей помнить локально (защита от дублей/переупорядочивания)
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
-
-# Сколько строк отправлять за один POST (чтобы не зависать/не упираться в лимиты)
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# Логи: чтобы Render не буферизовал “долго молчит”
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -64,10 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger("rapira-worker")
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
-
-# Точность под numeric(18,8)
 Q8 = Decimal("0.00000001")
-
 
 # ───────────────────────── HELPERS ─────────────────────────
 
@@ -100,11 +88,6 @@ def q8_str(x: Decimal) -> str:
 _last_install_ts = 0.0
 
 def _playwright_install() -> None:
-    """
-    Runtime-установка браузеров. Это НЕ требует менять команды Render.
-    Ставим и chromium, и chromium-headless-shell, чтобы не ловить ошибку по headless_shell.
-    Защита от бесконечного дерганья install (не чаще раза в 10 минут).
-    """
     global _last_install_ts
     now = time.time()
     if now - _last_install_ts < 600:
@@ -159,16 +142,16 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         volume_usdt=t["volume_usdt"],
     )
 
-
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
+    # no_wait_after=True снижает шанс “внутренних ожиданий” при клике, если сайт дергает навигацию/оверлей
     for label in ["Я согласен", "Принять", "Accept"]:
         try:
             btn = page.locator(f"text={label}")
             if await btn.count() > 0:
                 logger.info("Found cookies banner, clicking '%s'...", label)
-                await btn.first.click(timeout=5_000)
+                await btn.first.click(timeout=5_000, no_wait_after=True)
                 await page.wait_for_timeout(300)
                 return
         except Exception:
@@ -176,18 +159,13 @@ async def accept_cookies_if_any(page: Page) -> None:
 
 
 async def ensure_last_trades_tab(page: Page) -> None:
-    """
-    Важно: держимся строго на 'Последние сделки'.
-    Не кликаем по другим вкладкам, чтобы не уводило в другой UI.
-    """
     try:
         tab = page.locator("text=Последние сделки")
         if await tab.count() > 0:
-            await tab.first.click(timeout=5_000)
+            await tab.first.click(timeout=5_000, no_wait_after=True)
             await page.wait_for_timeout(200)
     except Exception:
         pass
-
 
 # ───────────────────────── PARSING ─────────────────────────
 
@@ -196,35 +174,28 @@ TRADE_ROWS_SELECTOR = (
     "table.table-row-dashed tbody tr.table-orders-row"
 )
 
-async def wait_trade_rows(page: Page, max_wait_seconds: int = 25) -> List[Any]:
-    # мелкие интервалы, чтобы быстрее “срываться” на таймауты/перезапуски
-    deadline = time.monotonic() + max_wait_seconds
-    while time.monotonic() < deadline:
-        try:
-            rows = await page.query_selector_all(TRADE_ROWS_SELECTOR)
-            if rows:
-                return rows
-        except Exception:
-            pass
-        await page.wait_for_timeout(250)
-    return []
+# Быстрый сбор данных в 1 round-trip:
+# забираем тексты всех td и отдельный hint по price (td.text-success), если есть
+EVAL_JS = """
+(rows, limit) => rows.slice(0, limit).map(row => {
+  const tds = Array.from(row.querySelectorAll('td'));
+  const texts = tds.map(td => (td.innerText || '').trim());
+  const priceTd = row.querySelector('td.text-success');
+  const priceHint = priceTd ? (priceTd.innerText || '').trim() : null;
+  return { texts, priceHint };
+})
+"""
 
-
-async def parse_row(row: Any) -> Optional[Dict[str, Any]]:
-    """
-    Возвращает dict для вставки в БД или None.
-    """
+def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        tds = await row.query_selector_all("td")
-        if len(tds) < 3:
+        texts: List[str] = payload.get("texts") or []
+        if len(texts) < 3:
             return None
 
-        td_texts = [(await td.inner_text()).strip() for td in tds]
-
-        # 1) время
+        # время
         trade_time = None
         time_idx = None
-        for idx, txt in enumerate(td_texts):
+        for idx, txt in enumerate(texts):
             t = extract_time(txt)
             if t:
                 trade_time = t
@@ -233,18 +204,14 @@ async def parse_row(row: Any) -> Optional[Dict[str, Any]]:
         if not trade_time:
             return None
 
-        # 2) цена (пытаемся td.text-success)
         price: Optional[Decimal] = None
-        try:
-            price_td = await row.query_selector("td.text-success")
-            if price_td:
-                price = normalize_decimal((await price_td.inner_text()).strip())
-        except Exception:
-            pass
+        price_hint = payload.get("priceHint")
+        if price_hint:
+            price = normalize_decimal(price_hint)
 
-        # 3) все числа (кроме времени)
+        # числа (кроме времени)
         nums: List[Decimal] = []
-        for idx, txt in enumerate(td_texts):
+        for idx, txt in enumerate(texts):
             if idx == time_idx:
                 continue
             n = normalize_decimal(txt)
@@ -253,7 +220,7 @@ async def parse_row(row: Any) -> Optional[Dict[str, Any]]:
         if len(nums) < 2:
             return None
 
-        # 4) если цену не нашли — эвристика 40..200
+        # эвристика цены, если не нашли по классу
         if price is None:
             for n in nums:
                 if Decimal("40") <= n <= Decimal("200"):
@@ -262,7 +229,6 @@ async def parse_row(row: Any) -> Optional[Dict[str, Any]]:
         if price is None:
             price = nums[0]
 
-        # 5) объем USDT — другое число
         volume_usdt: Optional[Decimal] = None
         for n in nums:
             if n != price:
@@ -288,18 +254,34 @@ async def parse_row(row: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def scrape_window(page: Page) -> List[Dict[str, Any]]:
-    rows = await wait_trade_rows(page, max_wait_seconds=25)
-    if not rows:
-        return []
+async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
+    """
+    Важное отличие: вместо сотен await inner_text() делаем 1 eval_on_selector_all.
+    Это кратно быстрее и снимает ваши 25-секундные таймауты.
+    """
+    t0 = time.monotonic()
+
+    # ждем появления строк, но не бесконечно
+    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
+
+    payloads = await page.eval_on_selector_all(
+        TRADE_ROWS_SELECTOR,
+        EVAL_JS,
+        LIMIT,
+    )
 
     out: List[Dict[str, Any]] = []
-    for row in rows[:LIMIT]:
-        t = await parse_row(row)
+    for p in payloads:
+        t = parse_row_payload(p)
         if t:
             out.append(t)
-    return out
 
+    dt = time.monotonic() - t0
+    if dt > SCRAPE_TIMEOUT_SECONDS:
+        # без asyncio.wait_for и отмены корутин (меньше “побочных” TargetClosedError)
+        raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
+
+    return out
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -337,7 +319,6 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 
         logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
 
-
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
@@ -355,13 +336,15 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
         ),
     )
     page = await context.new_page()
+
+    # оставляем 10s на “обычные” действия, а для таблицы управляем через wait_for_selector с SCRAPE_TIMEOUT_SECONDS
     page.set_default_timeout(10_000)
 
     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(1_000)
+    await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
     await ensure_last_trades_tab(page)
-    await page.wait_for_timeout(400)
+    await page.wait_for_timeout(300)
     return browser, context, page
 
 
@@ -382,11 +365,9 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
     except Exception:
         pass
 
-
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
 async def worker() -> None:
-    # Исправлено: deque БЕЗ maxlen и ручное удаление из set при вытеснении
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
 
@@ -416,38 +397,34 @@ async def worker() -> None:
                     last_reload = time.monotonic()
                     last_heartbeat = time.monotonic()
 
-                # Heartbeat даже при “тишине”
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
                     logger.info("Heartbeat: alive. seen=%d", len(seen))
                     last_heartbeat = time.monotonic()
 
-                # Профилактический reload (UI может деградировать и “залипать”)
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(1_000)
+                    await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
                     last_reload = time.monotonic()
 
-                # Не кликай вкладку каждый цикл (может триггерить лаги/переключения)
                 if time.monotonic() - last_click_tab >= 15:
                     await ensure_last_trades_tab(page)
                     last_click_tab = time.monotonic()
 
-                # Главный анти-“молчание” фикс: таймаут на scrape
-                window = await asyncio.wait_for(scrape_window(page), timeout=SCRAPE_TIMEOUT_SECONDS)
+                # Быстрый сбор + собственный таймаут внутри (без asyncio.wait_for и отмен)
+                window = await scrape_window_fast(page)
 
                 if not window:
                     logger.warning("No rows parsed. Reloading page...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(1_000)
+                    await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
                     await asyncio.sleep(max(0.5, POLL_SECONDS))
                     continue
 
-                # Фильтруем по seen (вставляем старые -> новые)
                 new_rows: List[Dict[str, Any]] = []
                 for t in reversed(window):
                     k = trade_key(t)
@@ -468,15 +445,15 @@ async def worker() -> None:
                         json.dumps(new_rows[-1], ensure_ascii=False),
                     )
                     await supabase_upsert(new_rows)
-                else:
-                    # не “спамим” — только иногда, heartbeat уже есть
-                    pass
 
                 sleep_s = max(0.35, POLL_SECONDS + random.uniform(-0.15, 0.15))
                 await asyncio.sleep(sleep_s)
 
             except asyncio.TimeoutError:
-                logger.error("Timeout: scrape_window exceeded %.1fs. Restarting browser session...", SCRAPE_TIMEOUT_SECONDS)
+                logger.error(
+                    "Timeout: scrape_window exceeded %.1fs. Restarting browser session...",
+                    SCRAPE_TIMEOUT_SECONDS
+                )
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
