@@ -42,6 +42,16 @@ SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
+# ──────────────── PROXY (ДОБАВЛЕНО) ────────────────
+# Пример:
+# PROXY_SERVER=http://72.56.153.197:50100
+# PROXY_USERNAME=nemosyzin
+# PROXY_PASSWORD=...
+PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip()
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "").strip()
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "").strip()
+# ───────────────────────────────────────────────────
+
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -145,7 +155,6 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
-    # no_wait_after=True снижает шанс “внутренних ожиданий” при клике, если сайт дергает навигацию/оверлей
     for label in ["Я согласен", "Принять", "Accept"]:
         try:
             btn = page.locator(f"text={label}")
@@ -174,8 +183,6 @@ TRADE_ROWS_SELECTOR = (
     "table.table-row-dashed tbody tr.table-orders-row"
 )
 
-# Быстрый сбор данных в 1 round-trip:
-# забираем тексты всех td и отдельный hint по price (td.text-success), если есть
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
   const tds = Array.from(row.querySelectorAll('td'));
@@ -192,7 +199,6 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(texts) < 3:
             return None
 
-        # время
         trade_time = None
         time_idx = None
         for idx, txt in enumerate(texts):
@@ -209,7 +215,6 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if price_hint:
             price = normalize_decimal(price_hint)
 
-        # числа (кроме времени)
         nums: List[Decimal] = []
         for idx, txt in enumerate(texts):
             if idx == time_idx:
@@ -220,7 +225,6 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(nums) < 2:
             return None
 
-        # эвристика цены, если не нашли по классу
         if price is None:
             for n in nums:
                 if Decimal("40") <= n <= Decimal("200"):
@@ -255,13 +259,7 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
-    """
-    Важное отличие: вместо сотен await inner_text() делаем 1 eval_on_selector_all.
-    Это кратно быстрее и снимает ваши 25-секундные таймауты.
-    """
     t0 = time.monotonic()
-
-    # ждем появления строк, но не бесконечно
     await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
 
     payloads = await page.eval_on_selector_all(
@@ -278,7 +276,6 @@ async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
 
     dt = time.monotonic() - t0
     if dt > SCRAPE_TIMEOUT_SECONDS:
-        # без asyncio.wait_for и отмены корутин (меньше “побочных” TargetClosedError)
         raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
 
     return out
@@ -322,10 +319,22 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
+    # ──────────────── PROXY (ДОБАВЛЕНО) ────────────────
+    launch_kwargs = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+    }
+    if PROXY_SERVER:
+        launch_kwargs["proxy"] = {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME or None,
+            "password": PROXY_PASSWORD or None,
+        }
+        logger.info("Using proxy for browser: %s", PROXY_SERVER)
+    # ───────────────────────────────────────────────────
+
+    browser = await pw.chromium.launch(**launch_kwargs)
+
     context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
         locale="ru-RU",
@@ -337,7 +346,6 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     )
     page = await context.new_page()
 
-    # оставляем 10s на “обычные” действия, а для таблицы управляем через wait_for_selector с SCRAPE_TIMEOUT_SECONDS
     page.set_default_timeout(10_000)
 
     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -413,7 +421,6 @@ async def worker() -> None:
                     await ensure_last_trades_tab(page)
                     last_click_tab = time.monotonic()
 
-                # Быстрый сбор + собственный таймаут внутри (без asyncio.wait_for и отмен)
                 window = await scrape_window_fast(page)
 
                 if not window:
