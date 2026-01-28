@@ -17,9 +17,12 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
+# ВАЖНО: лучше сразу /ru (у тебя в браузере именно так)
 RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/ru/exchange/USDT_RUB")
+
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
+PAIR_SLUG = os.getenv("PAIR_SLUG", "USDT_RUB")  # используется для проверки page.url
 
 LIMIT = int(os.getenv("LIMIT", "150"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
@@ -39,8 +42,9 @@ SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# Масштаб “починки”, если цена/объём съехали. Обычно 1000.
-SCALE_FIX = Decimal(os.getenv("SCALE_FIX", "1000"))
+# Для USDT/RUB адекватный коридор. Если вдруг попадём на BTC/USDT (~90k) — отсекаем.
+MIN_EXPECTED_PRICE = Decimal(os.getenv("MIN_EXPECTED_PRICE", "30"))
+MAX_EXPECTED_PRICE = Decimal(os.getenv("MAX_EXPECTED_PRICE", "300"))
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -60,27 +64,11 @@ Q8 = Decimal("0.00000001")
 # ───────────────────────── HELPERS ─────────────────────────
 
 def normalize_decimal(text: str) -> Optional[Decimal]:
-    """
-    Поддержка форматов:
-    - "76.70"
-    - "76,70"
-    - "90 140,00"
-    - "12 968.32"
-    - с неразрывными пробелами
-    """
     t = (text or "").strip()
     if not t:
         return None
-
-    t = t.replace("\xa0", " ").strip()
-
-    # убираем пробелы-разделители тысяч
-    t = t.replace(" ", "")
-
-    # если есть запятая, считаем её десятичным разделителем
-    # (это ключевой момент для Ru-форматов)
+    t = t.replace("\xa0", " ").replace(" ", "")
     t = t.replace(",", ".")
-
     try:
         return Decimal(t)
     except (InvalidOperation, ValueError):
@@ -102,7 +90,6 @@ def q8_str(x: Decimal) -> str:
 
 
 _last_install_ts = 0.0
-
 def _playwright_install() -> None:
     global _last_install_ts
     now = time.time()
@@ -161,8 +148,8 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
-    # на Rapira встречаются разные кнопки: OK/Accept/Принять/Я согласен
-    for label in ["OK", "Я согласен", "Принять", "Accept"]:
+    # На Rapira часто "OK"
+    for label in ["OK", "Я согласен", "Принять", "Accept", "Согласен"]:
         try:
             btn = page.locator(f"text={label}")
             if await btn.count() > 0:
@@ -175,102 +162,96 @@ async def accept_cookies_if_any(page: Page) -> None:
 
 
 async def ensure_last_trades_tab(page: Page) -> None:
-    """
-    Пытаемся активировать вкладку «Последние сделки».
-    """
-    candidates = [
-        page.get_by_role("tab", name="Последние сделки"),
-        page.locator("text=Последние сделки"),
-    ]
-    for tab in candidates:
-        try:
-            if await tab.count() > 0:
-                await tab.first.click(timeout=5_000, no_wait_after=True)
-                await page.wait_for_timeout(250)
-                return
-        except Exception:
-            pass
-
-
-async def is_blocked_or_empty_shell(page: Page) -> bool:
-    """
-    Быстрая проверка: вдруг отдалась заглушка/блокировка, и таблица не появится.
-    """
+    # Вкладка "Последние сделки"
     try:
-        html = (await page.content())[:50_000].lower()
-        bad = [
-            "attention required", "cloudflare", "captcha",
-            "access denied", "blocked", "verify you are human",
-        ]
-        return any(x in html for x in bad)
+        tab = page.locator("text=Последние сделки")
+        if await tab.count() > 0:
+            await tab.first.click(timeout=7_000, no_wait_after=True)
+            await page.wait_for_timeout(250)
     except Exception:
-        return False
+        pass
 
-# ───────────────────────── SELECTORS / EVAL ─────────────────────────
 
-# Берём строки только внутри активной вкладки (важно: иначе Playwright может ждать “невидимую” таблицу)
+async def ensure_correct_pair(page: Page) -> None:
+    """
+    ГЛАВНАЯ защита от твоей проблемы:
+    если Playwright оказался не на /USDT_RUB (например на BTC_USDT),
+    мы НЕ парсим и принудительно возвращаемся на нужный URL.
+    """
+    url = page.url or ""
+    if PAIR_SLUG not in url:
+        logger.warning("Wrong pair URL detected: %s (expected contains %s). Re-navigating...", url, PAIR_SLUG)
+        await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+        await page.wait_for_timeout(800)
+        await accept_cookies_if_any(page)
+        await ensure_last_trades_tab(page)
+        await page.wait_for_timeout(300)
+
+# ───────────────────────── PARSING ─────────────────────────
+# Берём строки ТОЛЬКО из активного tabpanel, чтобы не схватить чужую таблицу.
 TRADE_ROWS_SELECTOR = (
-    "div[role='tabpanel'][data-state='active'] "
+    "[role=tabpanel][data-state=active] "
     "div.table-responsive.table-orders "
-    "table tbody tr.table-orders-row"
+    "tbody tr.table-orders-row"
 )
 
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
   const tds = Array.from(row.querySelectorAll('td'));
-  const t = (i) => ((tds[i] && (tds[i].innerText || tds[i].textContent)) || '').trim();
-
-  // На сайте: 1-й td = Цена (может быть красным/зелёным), 2-й = Объём, 3-й = Время
-  const priceText  = t(0);
-  const volumeText = t(1);
-  const timeText   = t(2);
-
-  return { priceText, volumeText, timeText, raw: tds.map(x => (x.innerText||'').trim()) };
+  const cells = tds.map(td => (td.innerText || '').trim());
+  return { cells };
 })
 """
 
-def parse_payload(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    price_text = (p.get("priceText") or "").strip()
-    volume_text = (p.get("volumeText") or "").strip()
-    time_text = (p.get("timeText") or "").strip()
+def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    По твоей структуре:
+      td[0] = цена
+      td[1] = объем (USDT)
+      td[2] = время
+    """
+    try:
+        cells: List[str] = (payload.get("cells") or [])
+        if len(cells) < 3:
+            return None
 
-    trade_time = extract_time(time_text) or extract_time(" ".join(p.get("raw") or []))
-    if not trade_time:
+        price_txt = cells[0]
+        vol_txt = cells[1]
+        time_txt = cells[2]
+
+        trade_time = extract_time(time_txt)
+        if not trade_time:
+            return None
+
+        price = normalize_decimal(price_txt)
+        volume_usdt = normalize_decimal(vol_txt)
+        if price is None or volume_usdt is None:
+            return None
+        if price <= 0 or volume_usdt <= 0:
+            return None
+
+        # Отсечка от "не той пары" (BTC/USDT ~ 90k и т.п.)
+        if not (MIN_EXPECTED_PRICE <= price <= MAX_EXPECTED_PRICE):
+            # Это НЕ ошибка парсинга — это защита от неверной страницы/пары.
+            return {"__bad_pair__": True, "price": str(price), "raw": cells}
+
+        volume_rub = price * volume_usdt
+
+        return {
+            "source": SOURCE,
+            "symbol": SYMBOL,
+            "price": q8_str(price),
+            "volume_usdt": q8_str(volume_usdt),
+            "volume_rub": q8_str(volume_rub),
+            "trade_time": trade_time,
+        }
+    except Exception:
         return None
 
-    price = normalize_decimal(price_text)
-    volume_usdt = normalize_decimal(volume_text)
 
-    if price is None or volume_usdt is None:
-        return None
-
-    # ── Авто-фикс масштаба (типичный кейс: price хранится как price*1000, volume как volume/1000)
-    # Пример из твоей БД: price=90297.5 и volume=0.0535 => должны стать price=90.2975 и volume=53.5
-    if price >= Decimal("1000") and volume_usdt < Decimal("1"):
-        price = price / SCALE_FIX
-        volume_usdt = volume_usdt * SCALE_FIX
-
-    if price <= 0 or volume_usdt <= 0:
-        return None
-
-    volume_rub = price * volume_usdt
-
-    return {
-        "source": SOURCE,
-        "symbol": SYMBOL,
-        "price": q8_str(price),
-        "volume_usdt": q8_str(volume_usdt),
-        "volume_rub": q8_str(volume_rub),
-        "trade_time": trade_time,
-    }
-
-
-async def scrape_window(page: Page) -> List[Dict[str, Any]]:
+async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
     t0 = time.monotonic()
 
-    await ensure_last_trades_tab(page)
-
-    # ждём появления строк
     await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
 
     payloads = await page.eval_on_selector_all(
@@ -280,14 +261,27 @@ async def scrape_window(page: Page) -> List[Dict[str, Any]]:
     )
 
     out: List[Dict[str, Any]] = []
+    bad_pair_hits = 0
+
     for p in payloads:
-        t = parse_payload(p)
-        if t:
-            out.append(t)
+        t = parse_row_payload(p)
+        if not t:
+            continue
+
+        if t.get("__bad_pair__"):
+            bad_pair_hits += 1
+            # не добавляем в out
+            continue
+
+        out.append(t)
+
+    # если заметили хотя бы несколько строк с "не тем" price — значит реально не та пара/страница
+    if bad_pair_hits >= 3:
+        raise RuntimeError("Detected wrong market/pair (price out of expected range). Need reload to correct pair.")
 
     dt = time.monotonic() - t0
     if dt > SCRAPE_TIMEOUT_SECONDS:
-        raise asyncio.TimeoutError(f"scrape_window took {dt:.2f}s")
+        raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
 
     return out
 
@@ -322,7 +316,7 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
                 return
 
             if r.status_code >= 300:
-                logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text[:5000])
+                logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text)
                 return
 
         logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
@@ -332,8 +326,13 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     browser = await pw.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
     )
+
     context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
         locale="ru-RU",
@@ -343,23 +342,24 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
+
+    # Немного "анти-бот" косметики
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    """)
+
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
-    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-    try:
-        logger.info("Opened %s (status=%s) final_url=%s", RAPIRA_URL, getattr(resp, "status", None), page.url)
-    except Exception:
-        pass
+    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    logger.info("Opened %s final_url=%s", RAPIRA_URL, page.url)
+    await page.wait_for_timeout(900)
 
-    await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
     await ensure_last_trades_tab(page)
-    await page.wait_for_timeout(300)
+    await ensure_correct_pair(page)
 
-    if await is_blocked_or_empty_shell(page):
-        raise RuntimeError("Page looks blocked (cloudflare/captcha).")
-
+    await page.wait_for_timeout(400)
     return browser, context, page
 
 
@@ -412,30 +412,35 @@ async def worker() -> None:
                     last_reload = time.monotonic()
                     last_heartbeat = time.monotonic()
 
+                # контроль, что мы на нужной паре
+                await ensure_correct_pair(page)
+
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                    logger.info("Heartbeat: alive. seen=%d", len(seen))
+                    logger.info("Heartbeat: alive. seen=%d url=%s", len(seen), page.url)
                     last_heartbeat = time.monotonic()
 
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(900)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
+                    await ensure_correct_pair(page)
                     last_reload = time.monotonic()
 
                 if time.monotonic() - last_click_tab >= 15:
                     await ensure_last_trades_tab(page)
                     last_click_tab = time.monotonic()
 
-                window = await scrape_window(page)
+                window = await scrape_window_fast(page)
 
                 if not window:
-                    logger.warning("No rows parsed. Reloading page...")
+                    logger.warning("No rows parsed. Reloading page... url=%s", page.url)
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(900)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
+                    await ensure_correct_pair(page)
                     await asyncio.sleep(max(0.5, POLL_SECONDS))
                     continue
 
