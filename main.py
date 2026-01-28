@@ -17,7 +17,6 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
-# Фиксируем RU URL (у тебя так открывается в браузере)
 RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/ru/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
@@ -36,15 +35,12 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
-# Если 1 — вообще не пытаемся делать playwright install в рантайме
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
-
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# Debug-дампы HTML при ошибках селектора
-DEBUG_DUMP = os.getenv("DEBUG_DUMP", "1") == "1"
-DEBUG_HTML_HEAD = int(os.getenv("DEBUG_HTML_HEAD", "3000"))
+# Масштаб “починки”, если цена/объём съехали. Обычно 1000.
+SCALE_FIX = Decimal(os.getenv("SCALE_FIX", "1000"))
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -61,15 +57,30 @@ logger = logging.getLogger("rapira-worker")
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
 Q8 = Decimal("0.00000001")
 
-
 # ───────────────────────── HELPERS ─────────────────────────
 
 def normalize_decimal(text: str) -> Optional[Decimal]:
+    """
+    Поддержка форматов:
+    - "76.70"
+    - "76,70"
+    - "90 140,00"
+    - "12 968.32"
+    - с неразрывными пробелами
+    """
     t = (text or "").strip()
     if not t:
         return None
-    t = t.replace("\xa0", " ").replace(" ", "")
+
+    t = t.replace("\xa0", " ").strip()
+
+    # убираем пробелы-разделители тысяч
+    t = t.replace(" ", "")
+
+    # если есть запятая, считаем её десятичным разделителем
+    # (это ключевой момент для Ru-форматов)
     t = t.replace(",", ".")
+
     try:
         return Decimal(t)
     except (InvalidOperation, ValueError):
@@ -92,12 +103,7 @@ def q8_str(x: Decimal) -> str:
 
 _last_install_ts = 0.0
 
-
 def _playwright_install() -> None:
-    """
-    На Render иногда пропадают/не докачиваются браузеры. Этот блок пытается поставить их в рантайме.
-    ВАЖНО: вызываем ТОЛЬКО когда ошибка реально про "Executable doesn't exist".
-    """
     global _last_install_ts
     now = time.time()
     if now - _last_install_ts < 600:
@@ -134,30 +140,6 @@ def _should_force_install(err: Exception) -> bool:
     )
 
 
-async def debug_dump(page: Optional[Page], reason: str) -> None:
-    """
-    Печатаем диагностику, чтобы понять, что Render реально видит:
-    редирект? 403? антибот? другая разметка?
-    """
-    if not DEBUG_DUMP or page is None:
-        return
-    try:
-        url = page.url
-    except Exception:
-        url = "<no-url>"
-    try:
-        title = await page.title()
-    except Exception:
-        title = "<no-title>"
-    logger.error("DEBUG DUMP (%s): url=%s title=%s", reason, url, title)
-    try:
-        html = await page.content()
-        head = html[:DEBUG_HTML_HEAD].replace("\n", " ")
-        logger.error("DEBUG HTML head: %s", head)
-    except Exception as e:
-        logger.error("DEBUG content() failed: %s", e)
-
-
 @dataclass(frozen=True)
 class TradeKey:
     source: str
@@ -176,15 +158,11 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         volume_usdt=t["volume_usdt"],
     )
 
-
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
-COOKIE_LABELS = ["Я согласен", "Принять", "Accept", "Согласен", "ОК", "OK"]
-TAB_LABELS = ["История", "Последние сделки", "Trades", "History"]
-
-
 async def accept_cookies_if_any(page: Page) -> None:
-    for label in COOKIE_LABELS:
+    # на Rapira встречаются разные кнопки: OK/Accept/Принять/Я согласен
+    for label in ["OK", "Я согласен", "Принять", "Accept"]:
         try:
             btn = page.locator(f"text={label}")
             if await btn.count() > 0:
@@ -196,11 +174,16 @@ async def accept_cookies_if_any(page: Page) -> None:
             pass
 
 
-async def ensure_history_tab(page: Page) -> None:
-    # В новой разметке сделки находятся в History/История (у тебя на скрине именно так).
-    for label in TAB_LABELS:
+async def ensure_last_trades_tab(page: Page) -> None:
+    """
+    Пытаемся активировать вкладку «Последние сделки».
+    """
+    candidates = [
+        page.get_by_role("tab", name="Последние сделки"),
+        page.locator("text=Последние сделки"),
+    ]
+    for tab in candidates:
         try:
-            tab = page.locator(f"text={label}")
             if await tab.count() > 0:
                 await tab.first.click(timeout=5_000, no_wait_after=True)
                 await page.wait_for_timeout(250)
@@ -209,133 +192,104 @@ async def ensure_history_tab(page: Page) -> None:
             pass
 
 
-# ───────────────────────── PARSING ─────────────────────────
+async def is_blocked_or_empty_shell(page: Page) -> bool:
+    """
+    Быстрая проверка: вдруг отдалась заглушка/блокировка, и таблица не появится.
+    """
+    try:
+        html = (await page.content())[:50_000].lower()
+        bad = [
+            "attention required", "cloudflare", "captcha",
+            "access denied", "blocked", "verify you are human",
+        ]
+        return any(x in html for x in bad)
+    except Exception:
+        return False
 
-# Более устойчивый селектор (не привязан к table-row-dashed и т.п.)
-TRADE_ROWS_SELECTORS = [
-    "div.table-responsive.table-orders tbody tr.table-orders-row",
-    "div.table-responsive.table-orders tbody tr",
-    "table tbody tr.table-orders-row",
-    "table tbody tr",
-]
+# ───────────────────────── SELECTORS / EVAL ─────────────────────────
 
-# Забираем тексты всех td + (опционально) подсказку цены из td.text-success
+# Берём строки только внутри активной вкладки (важно: иначе Playwright может ждать “невидимую” таблицу)
+TRADE_ROWS_SELECTOR = (
+    "div[role='tabpanel'][data-state='active'] "
+    "div.table-responsive.table-orders "
+    "table tbody tr.table-orders-row"
+)
+
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
   const tds = Array.from(row.querySelectorAll('td'));
-  const texts = tds.map(td => (td.innerText || '').trim());
-  const priceTd = row.querySelector('td.text-success');
-  const priceHint = priceTd ? (priceTd.innerText || '').trim() : null;
-  return { texts, priceHint };
+  const t = (i) => ((tds[i] && (tds[i].innerText || tds[i].textContent)) || '').trim();
+
+  // На сайте: 1-й td = Цена (может быть красным/зелёным), 2-й = Объём, 3-й = Время
+  const priceText  = t(0);
+  const volumeText = t(1);
+  const timeText   = t(2);
+
+  return { priceText, volumeText, timeText, raw: tds.map(x => (x.innerText||'').trim()) };
 })
 """
 
+def parse_payload(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    price_text = (p.get("priceText") or "").strip()
+    volume_text = (p.get("volumeText") or "").strip()
+    time_text = (p.get("timeText") or "").strip()
 
-def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        texts: List[str] = payload.get("texts") or []
-        if len(texts) < 3:
-            return None
-
-        trade_time = None
-        time_idx = None
-        for idx, txt in enumerate(texts):
-            t = extract_time(txt)
-            if t:
-                trade_time = t
-                time_idx = idx
-                break
-        if not trade_time:
-            return None
-
-        price: Optional[Decimal] = None
-        price_hint = payload.get("priceHint")
-        if price_hint:
-            price = normalize_decimal(price_hint)
-
-        nums: List[Decimal] = []
-        for idx, txt in enumerate(texts):
-            if idx == time_idx:
-                continue
-            n = normalize_decimal(txt)
-            if n is not None:
-                nums.append(n)
-        if len(nums) < 2:
-            return None
-
-        if price is None:
-            # эвристика цены: курс USDT/RUB примерно в диапазоне 40..200
-            for n in nums:
-                if Decimal("40") <= n <= Decimal("200"):
-                    price = n
-                    break
-        if price is None:
-            price = nums[0]
-
-        volume_usdt: Optional[Decimal] = None
-        for n in nums:
-            if n != price:
-                volume_usdt = n
-                break
-        if volume_usdt is None:
-            volume_usdt = nums[1]
-
-        if price <= 0 or volume_usdt <= 0:
-            return None
-
-        volume_rub = price * volume_usdt
-
-        return {
-            "source": SOURCE,
-            "symbol": SYMBOL,
-            "price": q8_str(price),
-            "volume_usdt": q8_str(volume_usdt),
-            "volume_rub": q8_str(volume_rub),
-            "trade_time": trade_time,
-        }
-    except Exception:
+    trade_time = extract_time(time_text) or extract_time(" ".join(p.get("raw") or []))
+    if not trade_time:
         return None
 
+    price = normalize_decimal(price_text)
+    volume_usdt = normalize_decimal(volume_text)
 
-async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
-    """
-    Ждем строки через state='attached' (не 'visible'), чтобы не ловить баги видимости/вкладок.
-    Плюс используем список селекторов-фолбеков.
-    """
+    if price is None or volume_usdt is None:
+        return None
+
+    # ── Авто-фикс масштаба (типичный кейс: price хранится как price*1000, volume как volume/1000)
+    # Пример из твоей БД: price=90297.5 и volume=0.0535 => должны стать price=90.2975 и volume=53.5
+    if price >= Decimal("1000") and volume_usdt < Decimal("1"):
+        price = price / SCALE_FIX
+        volume_usdt = volume_usdt * SCALE_FIX
+
+    if price <= 0 or volume_usdt <= 0:
+        return None
+
+    volume_rub = price * volume_usdt
+
+    return {
+        "source": SOURCE,
+        "symbol": SYMBOL,
+        "price": q8_str(price),
+        "volume_usdt": q8_str(volume_usdt),
+        "volume_rub": q8_str(volume_rub),
+        "trade_time": trade_time,
+    }
+
+
+async def scrape_window(page: Page) -> List[Dict[str, Any]]:
     t0 = time.monotonic()
 
-    selector_used = None
-    last_err = None
-    for sel in TRADE_ROWS_SELECTORS:
-        try:
-            await page.wait_for_selector(sel, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000), state="attached")
-            selector_used = sel
-            break
-        except Exception as e:
-            last_err = e
+    await ensure_last_trades_tab(page)
 
-    if not selector_used:
-        await debug_dump(page, f"no-rows; last_err={last_err}")
-        raise asyncio.TimeoutError("trade rows not found")
+    # ждём появления строк
+    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
 
     payloads = await page.eval_on_selector_all(
-        selector_used,
+        TRADE_ROWS_SELECTOR,
         EVAL_JS,
         LIMIT,
     )
 
     out: List[Dict[str, Any]] = []
     for p in payloads:
-        t = parse_row_payload(p)
+        t = parse_payload(p)
         if t:
             out.append(t)
 
     dt = time.monotonic() - t0
     if dt > SCRAPE_TIMEOUT_SECONDS:
-        raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
+        raise asyncio.TimeoutError(f"scrape_window took {dt:.2f}s")
 
     return out
-
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -368,22 +322,17 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
                 return
 
             if r.status_code >= 300:
-                logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text)
+                logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text[:5000])
                 return
 
         logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
-
 
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     browser = await pw.chromium.launch(
         headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
     context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
@@ -394,25 +343,23 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
-    await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
     resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-    status = resp.status if resp else None
-    logger.info("Opened %s (status=%s) final_url=%s", RAPIRA_URL, status, page.url)
-
-    # Иногда таблица появляется после дополнительных XHR
     try:
-        await page.wait_for_load_state("networkidle", timeout=20_000)
+        logger.info("Opened %s (status=%s) final_url=%s", RAPIRA_URL, getattr(resp, "status", None), page.url)
     except Exception:
         pass
 
     await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
-    await ensure_history_tab(page)
+    await ensure_last_trades_tab(page)
     await page.wait_for_timeout(300)
+
+    if await is_blocked_or_empty_shell(page):
+        raise RuntimeError("Page looks blocked (cloudflare/captcha).")
+
     return browser, context, page
 
 
@@ -432,7 +379,6 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
             await browser.close()
     except Exception:
         pass
-
 
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
@@ -457,8 +403,7 @@ async def worker() -> None:
                     try:
                         browser, context, page = await open_browser(pw)
                     except Exception as e:
-                        # ВАЖНО: ставим браузеры только если ошибка реально про отсутствие executable
-                        if (not SKIP_BROWSER_INSTALL) and _should_force_install(e):
+                        if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
                             _playwright_install()
                             browser, context, page = await open_browser(pw)
                         else:
@@ -473,27 +418,24 @@ async def worker() -> None:
 
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
-                    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    logger.info("Reloaded (status=%s) url=%s", resp.status if resp else None, page.url)
+                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
-                    await ensure_history_tab(page)
+                    await ensure_last_trades_tab(page)
                     last_reload = time.monotonic()
 
                 if time.monotonic() - last_click_tab >= 15:
-                    await ensure_history_tab(page)
+                    await ensure_last_trades_tab(page)
                     last_click_tab = time.monotonic()
 
-                window = await scrape_window_fast(page)
+                window = await scrape_window(page)
 
                 if not window:
                     logger.warning("No rows parsed. Reloading page...")
-                    await debug_dump(page, "no-rows-parsed")
-                    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    logger.info("Reloaded (status=%s) url=%s", resp.status if resp else None, page.url)
+                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
-                    await ensure_history_tab(page)
+                    await ensure_last_trades_tab(page)
                     await asyncio.sleep(max(0.5, POLL_SECONDS))
                     continue
 
@@ -526,16 +468,13 @@ async def worker() -> None:
                     "Timeout: scrape_window exceeded %.1fs. Restarting browser session...",
                     SCRAPE_TIMEOUT_SECONDS
                 )
-                await debug_dump(page, "timeout")
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
             except Exception as e:
                 logger.error("Worker error: %s", e)
-                await debug_dump(page, f"worker-error: {e}")
 
-                # ВАЖНО: ставим браузеры только когда реально нужно
-                if (not SKIP_BROWSER_INSTALL) and _should_force_install(e):
+                if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
                     _playwright_install()
 
                 logger.info("Retrying after %.1fs ...", backoff)
