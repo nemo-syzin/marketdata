@@ -13,17 +13,18 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
-# ВАЖНО: без /ru/ (у Rapira это часто "витрина", а SPA потом перекидывает куда хочет)
-RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB").strip()
-PAIR_PATH_NEEDLE = "/exchange/USDT_RUB"  # для проверки URL
-PAIR_TEXT = os.getenv("PAIR_TEXT", "USDT/RUB")  # текст пары в UI
-
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
+
+# Целевая пара и страницы
+PAIR_CODE = os.getenv("PAIR_CODE", "USDT_RUB")  # часть URL
+RAPIRA_BASE = os.getenv("RAPIRA_BASE", "https://rapira.net").rstrip("/")
+RAPIRA_EXCHANGE_RU = f"{RAPIRA_BASE}/ru/exchange"
+RAPIRA_PAIR_URL = os.getenv("RAPIRA_URL", f"{RAPIRA_EXCHANGE_RU}/{PAIR_CODE}")
 
 LIMIT = int(os.getenv("LIMIT", "150"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
@@ -38,14 +39,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
-# Дедуп по окну
+SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
-
-# Авто-установка браузеров Playwright (Render)
-SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
-
-# ───────────────────────── LOGGING ─────────────────────────
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -75,6 +71,7 @@ def normalize_decimal(text: str) -> Optional[Decimal]:
     except (InvalidOperation, ValueError):
         return None
 
+
 def extract_time(text: str) -> Optional[str]:
     m = TIME_RE.search((text or "").replace("\xa0", " "))
     if not m:
@@ -84,8 +81,10 @@ def extract_time(text: str) -> Optional[str]:
         hh = "0" + hh
     return f"{hh}:{mm}:{ss}"
 
+
 def q8_str(x: Decimal) -> str:
     return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
+
 
 _last_install_ts = 0.0
 
@@ -115,6 +114,7 @@ def _playwright_install() -> None:
     except Exception as e:
         logger.error("Cannot run playwright install: %s", e)
 
+
 def _should_force_install(err: Exception) -> bool:
     s = str(err)
     return (
@@ -124,6 +124,7 @@ def _should_force_install(err: Exception) -> bool:
         or ("ms-playwright" in s and "doesn't exist" in s)
     )
 
+
 @dataclass(frozen=True)
 class TradeKey:
     source: str
@@ -131,6 +132,7 @@ class TradeKey:
     trade_time: str
     price: str
     volume_usdt: str
+
 
 def trade_key(t: Dict[str, Any]) -> TradeKey:
     return TradeKey(
@@ -141,197 +143,255 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         volume_usdt=t["volume_usdt"],
     )
 
-# ───────────────────────── UI ACTIONS ─────────────────────────
+# ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
-    # В логах у тебя было "OK"
-    for label in ["OK", "ОК", "Я согласен", "Принять", "Accept", "Согласен"]:
+    # Rapira часто показывает баннер, он мешает кликам.
+    for label in ["OK", "Я согласен", "Принять", "Accept"]:
         try:
-            btn = page.locator(f"text={label}")
-            if await btn.count() > 0 and await btn.first.is_visible():
+            btn = page.get_by_text(label, exact=True)
+            if await btn.count() > 0:
                 logger.info("Found cookies banner, clicking '%s'...", label)
                 await btn.first.click(timeout=5_000, no_wait_after=True)
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(350)
                 return
         except Exception:
             pass
 
+
 async def ensure_last_trades_tab(page: Page) -> None:
-    # В UI таб называется "Последние сделки"
+    # На странице есть вкладки "Стакан / Последние сделки"
     try:
-        tab = page.locator("text=Последние сделки")
-        if await tab.count() > 0 and await tab.first.is_visible():
+        tab = page.get_by_text("Последние сделки", exact=False)
+        if await tab.count() > 0:
             await tab.first.click(timeout=5_000, no_wait_after=True)
-            await page.wait_for_timeout(200)
-    except Exception:
-        pass
-
-async def _find_top_pair_button_text(page: Page) -> Optional[str]:
-    """
-    Находит текст кнопки пары вверху (самый верхний матч вида AAA/BBB).
-    Мы берем элемент с минимальным y (topmost), чтобы не спутать с таблицей сделок.
-    """
-    js = r"""
-    () => {
-      const re = /^[A-Z0-9]{2,10}\/[A-Z0-9]{2,10}$/;
-      const nodes = Array.from(document.querySelectorAll("a,button,div,span"))
-        .filter(el => {
-          const t = (el.innerText || "").trim();
-          if (!re.test(t)) return false;
-          const r = el.getBoundingClientRect();
-          // отсекаем таблицу: берём верхнюю зону страницы
-          return r.width > 30 && r.height > 10 && r.top >= 0 && r.top < 220 && r.left < 600;
-        })
-        .map(el => {
-          const r = el.getBoundingClientRect();
-          return { text: (el.innerText || "").trim(), top: r.top, left: r.left };
-        })
-        .sort((a,b) => (a.top - b.top) || (a.left - b.left));
-      return nodes.length ? nodes[0].text : null;
-    }
-    """
-    try:
-        return await page.evaluate(js)
-    except Exception:
-        return None
-
-async def force_select_pair_ui(page: Page) -> None:
-    """
-    Жёстко выбираем пару PAIR_TEXT через UI, даже если нас редиректнуло.
-    Алгоритм:
-      1) находим верхний переключатель пары (текст вида BTC/USDT и т.п.)
-      2) кликаем
-      3) в открывшемся меню ищем и кликаем USDT/RUB (или через поиск, если есть input)
-    """
-    current_pair = await _find_top_pair_button_text(page)
-    if not current_pair:
-        # fallback: иногда виден прямо нужный текст — просто кликаем по нему вверху
-        current_pair = "BTC/USDT"
-
-    # 1) клик по текущей паре вверху
-    try:
-        locator = page.locator(f"xpath=//*[self::a or self::button or self::div or self::span][normalize-space(text())='{current_pair}']")
-        if await locator.count() > 0:
-            await locator.first.click(timeout=8_000, no_wait_after=True)
-            await page.wait_for_timeout(350)
-    except Exception:
-        pass
-
-    # 2) если есть поле поиска — используем его
-    try:
-        search_input = page.locator("xpath=//input[@type='text' or @type='search']")
-        if await search_input.count() > 0 and await search_input.first.is_visible():
-            await search_input.first.fill(PAIR_TEXT, timeout=3_000)
             await page.wait_for_timeout(250)
     except Exception:
         pass
 
-    # 3) кликаем по пункту USDT/RUB в выпадающем меню
-    # Берём первый видимый матч
+
+def _is_wrong_pair_url(url: str) -> bool:
+    u = (url or "").lower()
+    # В логах у тебя именно это: /exchange/BTC_USDT и иногда /
+    if "/exchange/btc_usdt" in u:
+        return True
+    # иногда выкидывает на корень
+    if u.rstrip("/") == RAPIRA_BASE.lower():
+        return True
+    return False
+
+
+async def _page_shows_usdt_rub(page: Page) -> bool:
+    """
+    Проверяем не только URL, но и то, что UI реально показывает USDT/RUB.
+    Ты дал разметку:
+      <span class="fw-bold fs-6"><span>USDT</span><span class="fw-normal">/RUB</span></span>
+    """
     try:
-        item = page.locator(f"text={PAIR_TEXT}")
-        if await item.count() > 0:
-            # иногда первый матч в таблице — поэтому выбираем видимый и ближе к верху
-            # (в большинстве случаев item.first — как раз в меню)
-            await item.first.click(timeout=8_000, no_wait_after=True)
-            await page.wait_for_timeout(800)
+        loc = page.locator("span.fw-bold.fs-6")
+        if await loc.count() == 0:
+            return False
+        # Берём видимый заголовок пары (как в твоём DOM)
+        txt = (await loc.first.inner_text(timeout=2_000)).strip().replace(" ", "")
+        return "USDT/RUB" in txt
+    except Exception:
+        return False
+
+
+async def open_pair_menu(page: Page) -> None:
+    # Меню выбора пары: div.trading-pair-block-menu (видно на твоём скрине)
+    candidates = [
+        "div.trading-pair-block-menu",
+        "div.trading-pair-block-menu.d-flex",
+        "div.trading-pair-block-menu.cursor-pointer",
+    ]
+    for sel in candidates:
+        try:
+            m = page.locator(sel)
+            if await m.count() > 0:
+                await m.first.click(timeout=5_000, no_wait_after=True)
+                await page.wait_for_timeout(250)
+                return
+        except Exception:
+            pass
+    # Fallback: клик по заголовку USDT/RUB (если уже отображается)
+    try:
+        title = page.locator("span.fw-bold.fs-6")
+        if await title.count() > 0:
+            await title.first.click(timeout=5_000, no_wait_after=True)
+            await page.wait_for_timeout(250)
     except Exception:
         pass
 
-async def lock_pair(page: Page, attempts: int = 6) -> None:
+
+async def click_usdt_rub_in_list(page: Page) -> None:
     """
-    Гарантируем, что мы на USDT_RUB.
-    Если Rapira SPA нас уводит на BTC_USDT, возвращаем через UI выбор пары.
+    На странице /ru/exchange при открытом меню есть таблица пар:
+      tr.cursor-pointer.trading-pair-row ...
+    Мы кликаем строку, где есть текст USDT и /RUB.
     """
-    last_url = ""
+    # ждём, пока список пар появился
+    await page.wait_for_selector("tr.trading-pair-row", timeout=15_000)
+
+    # самый устойчивый вариант — искать по тексту строки
+    row = page.locator("tr.trading-pair-row").filter(has_text="USDT").filter(has_text="/RUB").first
+    if await row.count() == 0:
+        # иногда текст склеивается в USDT/RUB
+        row = page.locator("tr.trading-pair-row").filter(has_text="USDT/RUB").first
+
+    if await row.count() == 0:
+        raise RuntimeError("Cannot find USDT/RUB row in pair list")
+
+    await row.click(timeout=8_000, no_wait_after=True)
+
+
+async def lock_pair_usdt_rub(page: Page, attempts: int = 10) -> None:
+    """
+    Принудительно "закрепляем" пару USDT/RUB через UI.
+    Это важнее, чем просто page.goto(/USDT_RUB), потому что SPA может перекинуть обратно.
+    """
     for i in range(1, attempts + 1):
         url = page.url or ""
-        last_url = url
+        ok_url = (PAIR_CODE.lower() in url.lower()) or (f"/ru/exchange/{PAIR_CODE}".lower() in url.lower())
+        ok_ui = await _page_shows_usdt_rub(page)
 
-        ok_url = (PAIR_PATH_NEEDLE in url)
-        ok_text = False
-        try:
-            # Проверяем, что в верхней зоне есть нужный текст пары
-            ok_text = bool(await page.locator(f"xpath=//*[normalize-space(text())='{PAIR_TEXT}']").first.is_visible(timeout=1500))
-        except Exception:
-            ok_text = False
-
-        if ok_url and ok_text:
+        if ok_url and ok_ui and not _is_wrong_pair_url(url):
             return
 
         logger.warning(
-            "Wrong pair detected (attempt %d). url=%s; need %s and text %s",
-            i, url, PAIR_PATH_NEEDLE, PAIR_TEXT
+            "Wrong pair detected (attempt %d). url=%s; need %s and UI USDT/RUB",
+            i, url, RAPIRA_PAIR_URL
         )
 
-        # Пытаемся "прибить" SPA: очистить storage, заново перейти по URL, затем выбрать пару UI
+        # 1) Идём на общий exchange, 2) открываем меню, 3) кликаем USDT/RUB
         try:
-            await page.evaluate("() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }")
+            await page.goto(RAPIRA_EXCHANGE_RU, wait_until="domcontentloaded", timeout=60_000)
         except Exception:
             pass
 
+        await page.wait_for_timeout(700)
+        await accept_cookies_if_any(page)
+
+        await open_pair_menu(page)
+        await click_usdt_rub_in_list(page)
+
+        # ждём, что роутер реально переключил страницу на нужный URL
         try:
-            await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_url(f"**/{PAIR_CODE}", timeout=20_000)
         except Exception:
-            # если goto упал — просто продолжим UI-попытку
+            # если роутер не успел — не страшно, проверим дальше
             pass
 
         await page.wait_for_timeout(900)
-        await accept_cookies_if_any(page)
-        await force_select_pair_ui(page)
-        await ensure_last_trades_tab(page)
-        await page.wait_for_timeout(300)
 
-    raise RuntimeError(f"Cannot lock pair USDT_RUB. final_url={last_url}")
+    raise RuntimeError(f"Cannot lock pair {PAIR_CODE}. final_url={page.url}")
 
 # ───────────────────────── PARSING ─────────────────────────
 
-# По твоему DevTools: 1-й td = курс, 2-й = объём USDT, 3-й = время
-# Селектор делаем мягче, чтобы пережить мелкие правки классов:
-TRADE_ROWS_SELECTOR = "table tbody tr.table-orders-row"
+TRADE_ROWS_SELECTOR = (
+    "div.table-responsive.table-orders "
+    "table.table-row-dashed tbody tr.table-orders-row"
+)
 
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
   const tds = Array.from(row.querySelectorAll('td'));
   const texts = tds.map(td => (td.innerText || '').trim());
-  return { texts };
+  const priceTd = row.querySelector('td.text-success') || row.querySelector('td.text-danger');
+  const priceHint = priceTd ? (priceTd.innerText || '').trim() : null;
+  return { texts, priceHint };
 })
 """
 
+
 def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    texts: List[str] = (payload.get("texts") or [])
-    if len(texts) < 3:
+    try:
+        texts: List[str] = payload.get("texts") or []
+        if len(texts) < 3:
+            return None
+
+        trade_time = None
+        time_idx = None
+        for idx, txt in enumerate(texts):
+            t = extract_time(txt)
+            if t:
+                trade_time = t
+                time_idx = idx
+                break
+        if not trade_time:
+            return None
+
+        price: Optional[Decimal] = None
+        price_hint = payload.get("priceHint")
+        if price_hint:
+            price = normalize_decimal(price_hint)
+
+        nums: List[Decimal] = []
+        for idx, txt in enumerate(texts):
+            if idx == time_idx:
+                continue
+            n = normalize_decimal(txt)
+            if n is not None:
+                nums.append(n)
+        if len(nums) < 2:
+            return None
+
+        if price is None:
+            # Цена для USDT/RUB выглядит как ~70-120 в интерфейсе, но у тебя в БД было ~90000:
+            # это признак того, что ты парсил не то поле/не ту таблицу.
+            # Здесь мы берем priceHint (td.text-success) в приоритете.
+            for n in nums:
+                if Decimal("30") <= n <= Decimal("300"):
+                    price = n
+                    break
+        if price is None:
+            price = nums[0]
+
+        volume_usdt: Optional[Decimal] = None
+        for n in nums:
+            if n != price:
+                volume_usdt = n
+                break
+        if volume_usdt is None:
+            volume_usdt = nums[1]
+
+        if price <= 0 or volume_usdt <= 0:
+            return None
+
+        volume_rub = price * volume_usdt
+
+        return {
+            "source": SOURCE,
+            "symbol": SYMBOL,
+            "price": q8_str(price),
+            "volume_usdt": q8_str(volume_usdt),
+            "volume_rub": q8_str(volume_rub),
+            "trade_time": trade_time,
+        }
+    except Exception:
         return None
 
-    price = normalize_decimal(texts[0])
-    volume_usdt = normalize_decimal(texts[1])
-    trade_time = extract_time(texts[2])
-
-    if price is None or volume_usdt is None or trade_time is None:
-        return None
-    if price <= 0 or volume_usdt <= 0:
-        return None
-
-    volume_rub = price * volume_usdt
-
-    return {
-        "source": SOURCE,
-        "symbol": SYMBOL,
-        "price": q8_str(price),
-        "volume_usdt": q8_str(volume_usdt),
-        "volume_rub": q8_str(volume_rub),
-        "trade_time": trade_time,
-    }
 
 async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
+    t0 = time.monotonic()
     await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
-    payloads = await page.eval_on_selector_all(TRADE_ROWS_SELECTOR, EVAL_JS, LIMIT)
+
+    payloads = await page.eval_on_selector_all(
+        TRADE_ROWS_SELECTOR,
+        EVAL_JS,
+        LIMIT,
+    )
 
     out: List[Dict[str, Any]] = []
     for p in payloads:
         t = parse_row_payload(p)
         if t:
             out.append(t)
+
+    dt = time.monotonic() - t0
+    if dt > SCRAPE_TIMEOUT_SECONDS:
+        raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
+
     return out
 
 # ───────────────────────── SUPABASE ─────────────────────────
@@ -343,6 +403,7 @@ def _sb_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Prefer": "resolution=ignore-duplicates,return=minimal",
     }
+
 
 async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
     if not rows:
@@ -357,14 +418,40 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
     async with httpx.AsyncClient(timeout=UPSERT_TIMEOUT_SECONDS) as client:
         for i in range(0, len(rows), UPSERT_BATCH):
             chunk = rows[i:i + UPSERT_BATCH]
-            r = await client.post(url, headers=_sb_headers(), params=params, json=chunk)
+            try:
+                r = await client.post(url, headers=_sb_headers(), params=params, json=chunk)
+            except Exception as e:
+                logger.error("Supabase POST error: %s", e)
+                return
+
             if r.status_code >= 300:
                 logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text)
                 return
 
-    logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
+        logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
 
 # ───────────────────────── BROWSER SESSION ─────────────────────────
+
+INIT_JS_GUARD = f"""
+(() => {{
+  const good = "{RAPIRA_EXCHANGE_RU}/{PAIR_CODE}";
+  const bad1 = "/exchange/BTC_USDT";
+  const bad2 = "/exchange/btc_usdt";
+
+  const fixIfBad = () => {{
+    try {{
+      const p = (location.pathname || "");
+      if (p.includes(bad1) || p.includes(bad2) || location.href === "{RAPIRA_BASE}/" || location.href === "{RAPIRA_BASE}") {{
+        location.replace(good);
+      }}
+    }} catch(e) {{}}
+  }};
+
+  // SPA может сама пушить роут. Мы не ломаем роутер, но постоянно “сторожим” переход.
+  setInterval(fixIfBad, 200);
+}})();
+"""
+
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     browser = await pw.chromium.launch(
@@ -378,33 +465,28 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
         timezone_id="Europe/Moscow",
         user_agent=(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
 
-    # Правильная сигнатура add_init_script в Playwright Python:
-    # add_init_script(script) или add_init_script(path=...)
-    # Мы чистим storage до запуска SPA (уменьшает шанс «помнит BTC/USDT»)
-    try:
-        await context.add_init_script(
-            "() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }"
-        )
-    except Exception:
-        pass
+    # ВАЖНО: правильный вызов add_init_script
+    await context.add_init_script(script=INIT_JS_GUARD)
 
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
-    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(1000)
+    # Заходим на exchange (не на конкретную пару) и кликом “фиксируем” USDT/RUB
+    await page.goto(RAPIRA_EXCHANGE_RU, wait_until="domcontentloaded", timeout=60_000)
+    await page.wait_for_timeout(900)
     await accept_cookies_if_any(page)
 
-    # Критично: лочим пару (если Rapira уводит на BTC/USDT — вернём через UI)
-    await lock_pair(page, attempts=6)
-
+    await lock_pair_usdt_rub(page, attempts=10)
     await ensure_last_trades_tab(page)
-    await page.wait_for_timeout(400)
+    await page.wait_for_timeout(300)
+
+    logger.info("Opened %s final_url=%s", RAPIRA_EXCHANGE_RU, page.url)
     return browser, context, page
+
 
 async def safe_close(browser: Optional[Browser], context: Optional[BrowserContext], page: Optional[Page]) -> None:
     try:
@@ -432,7 +514,7 @@ async def worker() -> None:
     backoff = 2.0
     last_heartbeat = time.monotonic()
     last_reload = time.monotonic()
-    last_pair_check = 0.0
+    last_lock = 0.0
 
     async with async_playwright() as pw:
         browser: Optional[Browser] = None
@@ -454,37 +536,35 @@ async def worker() -> None:
                     backoff = 2.0
                     last_reload = time.monotonic()
                     last_heartbeat = time.monotonic()
-                    last_pair_check = time.monotonic()
+                    last_lock = time.monotonic()
 
-                now = time.monotonic()
+                if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
+                    logger.info("Heartbeat: alive. seen=%d url=%s", len(seen), page.url if page else None)
+                    last_heartbeat = time.monotonic()
 
-                if now - last_heartbeat >= HEARTBEAT_SECONDS:
-                    logger.info("Heartbeat: alive. seen=%d url=%s", len(seen), page.url)
-                    last_heartbeat = now
-
-                if now - last_reload >= RELOAD_EVERY_SECONDS:
+                # периодический reload (и повторный lock)
+                if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
-                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(1000)
+                    await page.goto(RAPIRA_EXCHANGE_RU, wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(900)
                     await accept_cookies_if_any(page)
-                    await lock_pair(page, attempts=6)
+                    await lock_pair_usdt_rub(page, attempts=10)
                     await ensure_last_trades_tab(page)
-                    last_reload = now
+                    last_reload = time.monotonic()
+                    last_lock = time.monotonic()
 
-                # ВАЖНО: Rapira может «самопроизвольно» переключать пару.
-                # Поэтому раз в ~20 сек проверяем и при необходимости возвращаем USDT/RUB.
-                if now - last_pair_check >= 20:
-                    await lock_pair(page, attempts=3)
-                    last_pair_check = now
+                # guard: если сайт снова увёл — возвращаемся
+                if page and (_is_wrong_pair_url(page.url) or not await _page_shows_usdt_rub(page)):
+                    if time.monotonic() - last_lock > 2.0:
+                        await lock_pair_usdt_rub(page, attempts=10)
+                        await ensure_last_trades_tab(page)
+                        last_lock = time.monotonic()
 
                 window = await scrape_window_fast(page)
 
                 if not window:
-                    logger.warning("No rows parsed. Reloading page...")
-                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(1000)
-                    await accept_cookies_if_any(page)
-                    await lock_pair(page, attempts=6)
+                    logger.warning("No rows parsed. Re-locking & reloading...")
+                    await lock_pair_usdt_rub(page, attempts=10)
                     await ensure_last_trades_tab(page)
                     await asyncio.sleep(max(0.5, POLL_SECONDS))
                     continue
@@ -514,7 +594,7 @@ async def worker() -> None:
                 await asyncio.sleep(sleep_s)
 
             except asyncio.TimeoutError:
-                logger.error("Timeout during scrape. Restarting browser session...")
+                logger.error("Timeout. Restarting browser session...")
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
@@ -531,8 +611,10 @@ async def worker() -> None:
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
+
 def main() -> None:
     asyncio.run(worker())
+
 
 if __name__ == "__main__":
     main()
