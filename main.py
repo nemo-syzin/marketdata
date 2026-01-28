@@ -17,13 +17,12 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
-RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB")
+# Фиксируем RU URL (у тебя так открывается в браузере)
+RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/ru/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
-# На Render 400 строк часто слишком медленно. Дефолт уменьшаем.
 LIMIT = int(os.getenv("LIMIT", "150"))
-
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
 
 SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "25"))
@@ -37,10 +36,15 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
+# Если 1 — вообще не пытаемся делать playwright install в рантайме
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
+
+# Debug-дампы HTML при ошибках селектора
+DEBUG_DUMP = os.getenv("DEBUG_DUMP", "1") == "1"
+DEBUG_HTML_HEAD = int(os.getenv("DEBUG_HTML_HEAD", "3000"))
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -56,6 +60,7 @@ logger = logging.getLogger("rapira-worker")
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
 Q8 = Decimal("0.00000001")
+
 
 # ───────────────────────── HELPERS ─────────────────────────
 
@@ -87,7 +92,12 @@ def q8_str(x: Decimal) -> str:
 
 _last_install_ts = 0.0
 
+
 def _playwright_install() -> None:
+    """
+    На Render иногда пропадают/не докачиваются браузеры. Этот блок пытается поставить их в рантайме.
+    ВАЖНО: вызываем ТОЛЬКО когда ошибка реально про "Executable doesn't exist".
+    """
     global _last_install_ts
     now = time.time()
     if now - _last_install_ts < 600:
@@ -124,6 +134,30 @@ def _should_force_install(err: Exception) -> bool:
     )
 
 
+async def debug_dump(page: Optional[Page], reason: str) -> None:
+    """
+    Печатаем диагностику, чтобы понять, что Render реально видит:
+    редирект? 403? антибот? другая разметка?
+    """
+    if not DEBUG_DUMP or page is None:
+        return
+    try:
+        url = page.url
+    except Exception:
+        url = "<no-url>"
+    try:
+        title = await page.title()
+    except Exception:
+        title = "<no-title>"
+    logger.error("DEBUG DUMP (%s): url=%s title=%s", reason, url, title)
+    try:
+        html = await page.content()
+        head = html[:DEBUG_HTML_HEAD].replace("\n", " ")
+        logger.error("DEBUG HTML head: %s", head)
+    except Exception as e:
+        logger.error("DEBUG content() failed: %s", e)
+
+
 @dataclass(frozen=True)
 class TradeKey:
     source: str
@@ -142,11 +176,15 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         volume_usdt=t["volume_usdt"],
     )
 
+
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
+COOKIE_LABELS = ["Я согласен", "Принять", "Accept", "Согласен", "ОК", "OK"]
+TAB_LABELS = ["История", "Последние сделки", "Trades", "History"]
+
+
 async def accept_cookies_if_any(page: Page) -> None:
-    # no_wait_after=True снижает шанс “внутренних ожиданий” при клике, если сайт дергает навигацию/оверлей
-    for label in ["Я согласен", "Принять", "Accept"]:
+    for label in COOKIE_LABELS:
         try:
             btn = page.locator(f"text={label}")
             if await btn.count() > 0:
@@ -158,24 +196,30 @@ async def accept_cookies_if_any(page: Page) -> None:
             pass
 
 
-async def ensure_last_trades_tab(page: Page) -> None:
-    try:
-        tab = page.locator("text=Последние сделки")
-        if await tab.count() > 0:
-            await tab.first.click(timeout=5_000, no_wait_after=True)
-            await page.wait_for_timeout(200)
-    except Exception:
-        pass
+async def ensure_history_tab(page: Page) -> None:
+    # В новой разметке сделки находятся в History/История (у тебя на скрине именно так).
+    for label in TAB_LABELS:
+        try:
+            tab = page.locator(f"text={label}")
+            if await tab.count() > 0:
+                await tab.first.click(timeout=5_000, no_wait_after=True)
+                await page.wait_for_timeout(250)
+                return
+        except Exception:
+            pass
+
 
 # ───────────────────────── PARSING ─────────────────────────
 
-TRADE_ROWS_SELECTOR = (
-    "div.table-responsive.table-orders "
-    "table.table-row-dashed tbody tr.table-orders-row"
-)
+# Более устойчивый селектор (не привязан к table-row-dashed и т.п.)
+TRADE_ROWS_SELECTORS = [
+    "div.table-responsive.table-orders tbody tr.table-orders-row",
+    "div.table-responsive.table-orders tbody tr",
+    "table tbody tr.table-orders-row",
+    "table tbody tr",
+]
 
-# Быстрый сбор данных в 1 round-trip:
-# забираем тексты всех td и отдельный hint по price (td.text-success), если есть
+# Забираем тексты всех td + (опционально) подсказку цены из td.text-success
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
   const tds = Array.from(row.querySelectorAll('td'));
@@ -186,13 +230,13 @@ EVAL_JS = """
 })
 """
 
+
 def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         texts: List[str] = payload.get("texts") or []
         if len(texts) < 3:
             return None
 
-        # время
         trade_time = None
         time_idx = None
         for idx, txt in enumerate(texts):
@@ -209,7 +253,6 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if price_hint:
             price = normalize_decimal(price_hint)
 
-        # числа (кроме времени)
         nums: List[Decimal] = []
         for idx, txt in enumerate(texts):
             if idx == time_idx:
@@ -220,8 +263,8 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(nums) < 2:
             return None
 
-        # эвристика цены, если не нашли по классу
         if price is None:
+            # эвристика цены: курс USDT/RUB примерно в диапазоне 40..200
             for n in nums:
                 if Decimal("40") <= n <= Decimal("200"):
                     price = n
@@ -256,16 +299,27 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
     """
-    Важное отличие: вместо сотен await inner_text() делаем 1 eval_on_selector_all.
-    Это кратно быстрее и снимает ваши 25-секундные таймауты.
+    Ждем строки через state='attached' (не 'visible'), чтобы не ловить баги видимости/вкладок.
+    Плюс используем список селекторов-фолбеков.
     """
     t0 = time.monotonic()
 
-    # ждем появления строк, но не бесконечно
-    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
+    selector_used = None
+    last_err = None
+    for sel in TRADE_ROWS_SELECTORS:
+        try:
+            await page.wait_for_selector(sel, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000), state="attached")
+            selector_used = sel
+            break
+        except Exception as e:
+            last_err = e
+
+    if not selector_used:
+        await debug_dump(page, f"no-rows; last_err={last_err}")
+        raise asyncio.TimeoutError("trade rows not found")
 
     payloads = await page.eval_on_selector_all(
-        TRADE_ROWS_SELECTOR,
+        selector_used,
         EVAL_JS,
         LIMIT,
     )
@@ -278,10 +332,10 @@ async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
 
     dt = time.monotonic() - t0
     if dt > SCRAPE_TIMEOUT_SECONDS:
-        # без asyncio.wait_for и отмены корутин (меньше “побочных” TargetClosedError)
         raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
 
     return out
+
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -319,12 +373,17 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 
         logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
 
+
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     browser = await pw.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
     )
     context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
@@ -335,15 +394,24 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
-    page = await context.new_page()
+    await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-    # оставляем 10s на “обычные” действия, а для таблицы управляем через wait_for_selector с SCRAPE_TIMEOUT_SECONDS
+    page = await context.new_page()
     page.set_default_timeout(10_000)
 
-    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    status = resp.status if resp else None
+    logger.info("Opened %s (status=%s) final_url=%s", RAPIRA_URL, status, page.url)
+
+    # Иногда таблица появляется после дополнительных XHR
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20_000)
+    except Exception:
+        pass
+
     await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
-    await ensure_last_trades_tab(page)
+    await ensure_history_tab(page)
     await page.wait_for_timeout(300)
     return browser, context, page
 
@@ -364,6 +432,7 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
             await browser.close()
     except Exception:
         pass
+
 
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
@@ -388,7 +457,8 @@ async def worker() -> None:
                     try:
                         browser, context, page = await open_browser(pw)
                     except Exception as e:
-                        if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
+                        # ВАЖНО: ставим браузеры только если ошибка реально про отсутствие executable
+                        if (not SKIP_BROWSER_INSTALL) and _should_force_install(e):
                             _playwright_install()
                             browser, context, page = await open_browser(pw)
                         else:
@@ -403,25 +473,27 @@ async def worker() -> None:
 
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
-                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    logger.info("Reloaded (status=%s) url=%s", resp.status if resp else None, page.url)
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
-                    await ensure_last_trades_tab(page)
+                    await ensure_history_tab(page)
                     last_reload = time.monotonic()
 
                 if time.monotonic() - last_click_tab >= 15:
-                    await ensure_last_trades_tab(page)
+                    await ensure_history_tab(page)
                     last_click_tab = time.monotonic()
 
-                # Быстрый сбор + собственный таймаут внутри (без asyncio.wait_for и отмен)
                 window = await scrape_window_fast(page)
 
                 if not window:
                     logger.warning("No rows parsed. Reloading page...")
-                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    await debug_dump(page, "no-rows-parsed")
+                    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    logger.info("Reloaded (status=%s) url=%s", resp.status if resp else None, page.url)
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
-                    await ensure_last_trades_tab(page)
+                    await ensure_history_tab(page)
                     await asyncio.sleep(max(0.5, POLL_SECONDS))
                     continue
 
@@ -454,13 +526,16 @@ async def worker() -> None:
                     "Timeout: scrape_window exceeded %.1fs. Restarting browser session...",
                     SCRAPE_TIMEOUT_SECONDS
                 )
+                await debug_dump(page, "timeout")
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
             except Exception as e:
                 logger.error("Worker error: %s", e)
+                await debug_dump(page, f"worker-error: {e}")
 
-                if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
+                # ВАЖНО: ставим браузеры только когда реально нужно
+                if (not SKIP_BROWSER_INSTALL) and _should_force_install(e):
                     _playwright_install()
 
                 logger.info("Retrying after %.1fs ...", backoff)
