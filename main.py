@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import json
 import logging
@@ -18,15 +17,13 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
-# ВАЖНО: по ответу поддержки — статическая ссылка именно такая:
-PAIR_URL = os.getenv("PAIR_URL", "https://rapira.net/exchange/USDT_RUB")
-PAIR_CODE = os.getenv("PAIR_CODE", "USDT_RUB")
-PAIR_TEXT = os.getenv("PAIR_TEXT", "USDT/RUB")
-
+RAPIRA_URL = os.getenv("RAPIRA_URL", "https://rapira.net/exchange/USDT_RUB")
 SOURCE = os.getenv("SOURCE", "rapira")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
+# На Render 400 строк часто слишком медленно. Дефолт уменьшаем.
 LIMIT = int(os.getenv("LIMIT", "150"))
+
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
 
 SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "25"))
@@ -38,14 +35,12 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
+ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
-
-LOCK_ATTEMPTS = int(os.getenv("LOCK_ATTEMPTS", "10"))
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -88,11 +83,6 @@ def extract_time(text: str) -> Optional[str]:
 
 def q8_str(x: Decimal) -> str:
     return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
-
-
-def url_is_pair(u: str) -> bool:
-    u = (u or "").lower()
-    return f"/exchange/{PAIR_CODE.lower()}" in u
 
 
 _last_install_ts = 0.0
@@ -155,13 +145,14 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
-    for label in ["OK", "Я согласен", "Принять", "Accept"]:
+    # no_wait_after=True снижает шанс “внутренних ожиданий” при клике, если сайт дергает навигацию/оверлей
+    for label in ["Я согласен", "Принять", "Accept"]:
         try:
             btn = page.locator(f"text={label}")
             if await btn.count() > 0:
                 logger.info("Found cookies banner, clicking '%s'...", label)
                 await btn.first.click(timeout=5_000, no_wait_after=True)
-                await page.wait_for_timeout(250)
+                await page.wait_for_timeout(300)
                 return
         except Exception:
             pass
@@ -176,95 +167,15 @@ async def ensure_last_trades_tab(page: Page) -> None:
     except Exception:
         pass
 
-
-async def verify_pair_ui(page: Page) -> bool:
-    try:
-        title = page.locator("span.fw-bold.fs-6").first
-        txt = (await title.inner_text(timeout=4_000)).replace(" ", "").upper()
-        return ("USDT" in txt and "/RUB" in txt)
-    except Exception:
-        return False
-
-
-async def open_pair_menu(page: Page) -> None:
-    await page.wait_for_selector("div.trading-pair-block-menu", timeout=15_000)
-    await page.locator("div.trading-pair-block-menu").first.click(timeout=10_000, no_wait_after=True)
-    await page.wait_for_timeout(200)
-
-
-async def click_pair_usdt_rub(page: Page) -> None:
-    await page.wait_for_selector("tr.trading-pair-row", timeout=15_000)
-    rows = page.locator("tr.trading-pair-row")
-    target = rows.filter(has_text="USDT").filter(has_text="/RUB").first
-    if await target.count() == 0:
-        target = rows.filter(has_text="USDT/RUB").first
-    if await target.count() == 0:
-        raise RuntimeError("USDT/RUB row not found in pair list")
-    await target.click(timeout=10_000, no_wait_after=True)
-    await page.wait_for_timeout(350)
-
-
-async def hard_go_pair(page: Page) -> None:
-    # Жёстко идём на “статическую” ссылку из поддержки
-    await page.goto(PAIR_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(900)
-    await accept_cookies_if_any(page)
-    await ensure_last_trades_tab(page)
-
-
-async def lock_pair(page: Page) -> None:
-    """
-    1) Сначала всегда пробуем "статическую" ссылку PAIR_URL.
-    2) Если сайт всё равно уводит/не тот UI — пробуем через меню.
-    """
-    for attempt in range(1, LOCK_ATTEMPTS + 1):
-        try:
-            await hard_go_pair(page)
-
-            # если URL совпал — отлично
-            if url_is_pair(page.url) and await verify_pair_ui(page):
-                logger.info("Pair locked via static url: %s", page.url)
-                return
-
-            # fallback: выбираем через меню на текущей странице (даже если это BTC_USDT)
-            await open_pair_menu(page)
-            await click_pair_usdt_rub(page)
-
-            # подождём URL либо UI
-            try:
-                await page.wait_for_url(f"**/{PAIR_CODE}", timeout=15_000)
-            except Exception:
-                pass
-
-            await ensure_last_trades_tab(page)
-
-            if url_is_pair(page.url) and await verify_pair_ui(page):
-                logger.info("Pair locked via menu: %s", page.url)
-                return
-
-            raise RuntimeError(f"still not locked (url={page.url})")
-
-        except Exception as e:
-            logger.warning(
-                "Lock attempt %d failed. url=%s err=%s",
-                attempt, page.url, str(e)[:180]
-            )
-            await page.wait_for_timeout(600 + random.randint(0, 400))
-
-    raise RuntimeError(f"Cannot lock pair {PAIR_CODE}. final_url={page.url}")
-
 # ───────────────────────── PARSING ─────────────────────────
 
-TRADE_ROWS_SELECTOR_1 = (
+TRADE_ROWS_SELECTOR = (
     "div.table-responsive.table-orders "
     "table.table-row-dashed tbody tr.table-orders-row"
 )
 
-TRADE_ROWS_SELECTOR_2 = (
-    "div.table-responsive.table-orders "
-    "table tbody tr"
-)
-
+# Быстрый сбор данных в 1 round-trip:
+# забираем тексты всех td и отдельный hint по price (td.text-success), если есть
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
   const tds = Array.from(row.querySelectorAll('td'));
@@ -281,6 +192,7 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(texts) < 3:
             return None
 
+        # время
         trade_time = None
         time_idx = None
         for idx, txt in enumerate(texts):
@@ -297,6 +209,7 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if price_hint:
             price = normalize_decimal(price_hint)
 
+        # числа (кроме времени)
         nums: List[Decimal] = []
         for idx, txt in enumerate(texts):
             if idx == time_idx:
@@ -307,7 +220,7 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(nums) < 2:
             return None
 
-        # эвристика цены для USDT/RUB
+        # эвристика цены, если не нашли по классу
         if price is None:
             for n in nums:
                 if Decimal("40") <= n <= Decimal("200"):
@@ -341,27 +254,33 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _eval_rows(page: Page, selector: str) -> List[Dict[str, Any]]:
-    await page.wait_for_selector(selector, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
-    payloads = await page.eval_on_selector_all(selector, EVAL_JS, LIMIT)
+async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
+    """
+    Важное отличие: вместо сотен await inner_text() делаем 1 eval_on_selector_all.
+    Это кратно быстрее и снимает ваши 25-секундные таймауты.
+    """
+    t0 = time.monotonic()
+
+    # ждем появления строк, но не бесконечно
+    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
+
+    payloads = await page.eval_on_selector_all(
+        TRADE_ROWS_SELECTOR,
+        EVAL_JS,
+        LIMIT,
+    )
+
     out: List[Dict[str, Any]] = []
     for p in payloads:
         t = parse_row_payload(p)
         if t:
             out.append(t)
-    return out
-
-
-async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
-    t0 = time.monotonic()
-    try:
-        out = await _eval_rows(page, TRADE_ROWS_SELECTOR_1)
-    except Exception:
-        out = await _eval_rows(page, TRADE_ROWS_SELECTOR_2)
 
     dt = time.monotonic() - t0
     if dt > SCRAPE_TIMEOUT_SECONDS:
+        # без asyncio.wait_for и отмены корутин (меньше “побочных” TargetClosedError)
         raise asyncio.TimeoutError(f"scrape_window_fast took {dt:.2f}s")
+
     return out
 
 # ───────────────────────── SUPABASE ─────────────────────────
@@ -407,7 +326,6 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
-
     context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
         locale="ru-RU",
@@ -417,19 +335,16 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
-
-    # корректный вызов (1 аргумент) + чистим storage, чтобы не восстанавливалось "последнее"
-    await context.add_init_script(
-        """() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }"""
-    )
-
     page = await context.new_page()
+
+    # оставляем 10s на “обычные” действия, а для таблицы управляем через wait_for_selector с SCRAPE_TIMEOUT_SECONDS
     page.set_default_timeout(10_000)
 
-    # ключ: начинаем сразу со "статической" ссылки
-    await hard_go_pair(page)
-    await lock_pair(page)
-
+    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    await page.wait_for_timeout(800)
+    await accept_cookies_if_any(page)
+    await ensure_last_trades_tab(page)
+    await page.wait_for_timeout(300)
     return browser, context, page
 
 
@@ -482,30 +397,31 @@ async def worker() -> None:
                     last_reload = time.monotonic()
                     last_heartbeat = time.monotonic()
 
-                # если куда-то “уплыли” — возвращаемся на PAIR_URL
-                if not url_is_pair(page.url) or not await verify_pair_ui(page):
-                    logger.warning("Pair guard failed (url=%s). Re-locking...", page.url)
-                    await lock_pair(page)
-
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                    logger.info("Heartbeat: alive. seen=%d url=%s", len(seen), page.url)
+                    logger.info("Heartbeat: alive. seen=%d", len(seen))
                     last_heartbeat = time.monotonic()
 
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
-                    await hard_go_pair(page)
-                    await lock_pair(page)
+                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(800)
+                    await accept_cookies_if_any(page)
+                    await ensure_last_trades_tab(page)
                     last_reload = time.monotonic()
 
                 if time.monotonic() - last_click_tab >= 15:
                     await ensure_last_trades_tab(page)
                     last_click_tab = time.monotonic()
 
+                # Быстрый сбор + собственный таймаут внутри (без asyncio.wait_for и отмен)
                 window = await scrape_window_fast(page)
 
                 if not window:
-                    logger.warning("No rows parsed. Re-lock pair and retry...")
-                    await lock_pair(page)
+                    logger.warning("No rows parsed. Reloading page...")
+                    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(800)
+                    await accept_cookies_if_any(page)
+                    await ensure_last_trades_tab(page)
                     await asyncio.sleep(max(0.5, POLL_SECONDS))
                     continue
 
