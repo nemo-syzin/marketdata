@@ -36,17 +36,14 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
+
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# ───────────────────────── PROXY (HARDCODED: YOUR DATA) ─────────────────────────
-# HTTP proxy:
-PROXY_SERVER = "http://72.56.153.197:50100"
-# SOCKS5 alternative (if you want to try): uncomment next line and comment the http line above
-# PROXY_SERVER = "socks5://72.56.153.197:50101"
-
-PROXY_USERNAME = "nemosyzin"
-PROXY_PASSWORD = "TDbaTDHbTA"
+# ───────────────────────── PROXY ─────────────────────────
+PROXY_SERVER = (os.getenv("PROXY_SERVER", "") or "").strip()           # e.g. http://res.proxy-seller.io:10000
+PROXY_USERNAME = (os.getenv("PROXY_USERNAME", "") or "").strip()       # from your residential string
+PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD", "") or "").strip()       # from your residential string
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -89,6 +86,37 @@ def extract_time(text: str) -> Optional[str]:
 
 def q8_str(x: Decimal) -> str:
     return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
+
+
+def _proxy_url_for_httpx() -> Optional[str]:
+    if not PROXY_SERVER:
+        return None
+    # httpx expects credentials in URL for simple use.
+    # If your username/password contain special chars, URL-encode them in ENV or switch to httpx.Proxy,
+    # but in Proxy-Seller tokens usually are safe.
+    if PROXY_USERNAME and PROXY_PASSWORD:
+        # Keep PROXY_SERVER like http://host:port
+        # Convert to http://user:pass@host:port
+        scheme, rest = PROXY_SERVER.split("://", 1) if "://" in PROXY_SERVER else ("http", PROXY_SERVER)
+        return f"{scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{rest}"
+    return PROXY_SERVER
+
+
+async def proxy_sanity_check() -> None:
+    px = _proxy_url_for_httpx()
+    if not px:
+        logger.warning("Proxy is NOT set. Rapira may block foreign IPs on Render.")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=15, proxies={"http://": px, "https://": px}) as client:
+            r1 = await client.get("https://api.ipify.org?format=json")
+            logger.info('Proxy IP check status=%s body=%s', r1.status_code, r1.text)
+
+            r2 = await client.get("https://ipinfo.io/json")
+            logger.info("Proxy GEO check status=%s body=%s", r2.status_code, r2.text)
+    except Exception as e:
+        logger.warning("Proxy check failed: %s", e)
 
 
 _last_install_ts = 0.0
@@ -171,6 +199,24 @@ async def ensure_last_trades_tab(page: Page) -> None:
             await page.wait_for_timeout(200)
     except Exception:
         pass
+
+
+async def dump_page_debug(page: Page, reason: str) -> None:
+    try:
+        url = page.url
+        title = await page.title()
+        body = await page.content()
+        # короткий срез, чтобы не утонуть в логах
+        snippet = body[:3000].replace("\n", " ")
+        logger.error("DEBUG DUMP (%s): url=%s title=%s html_snippet=%s", reason, url, title, snippet)
+
+        # частые причины
+        for needle in ["captcha", "Access denied", "Cloudflare", "DDoS", "blocked", "робот", "провер"]:
+            if needle.lower() in body.lower():
+                logger.error("DEBUG: looks like block/captcha keyword found: %s", needle)
+                break
+    except Exception as e:
+        logger.error("DEBUG dump failed: %s", e)
 
 # ───────────────────────── PARSING ─────────────────────────
 
@@ -316,12 +362,16 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
-    proxy_cfg = {
-        "server": PROXY_SERVER,
-        "username": PROXY_USERNAME,
-        "password": PROXY_PASSWORD,
-    }
-    logger.info("Using proxy for browser: %s", PROXY_SERVER)
+    proxy_cfg = None
+    if PROXY_SERVER:
+        proxy_cfg = {"server": PROXY_SERVER}
+        if PROXY_USERNAME:
+            proxy_cfg["username"] = PROXY_USERNAME
+        if PROXY_PASSWORD:
+            proxy_cfg["password"] = PROXY_PASSWORD
+        logger.info("Using proxy for browser: %s", PROXY_SERVER)
+    else:
+        logger.warning("Proxy is NOT set. Rapira may block foreign IPs on Render.")
 
     browser = await pw.chromium.launch(
         headless=True,
@@ -340,7 +390,10 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
-    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    status = resp.status if resp else None
+    logger.info("After goto: final_url=%s status=%s", page.url, status)
+
     await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
     await ensure_last_trades_tab(page)
@@ -368,6 +421,8 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
 async def worker() -> None:
+    await proxy_sanity_check()
+
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
 
@@ -416,6 +471,7 @@ async def worker() -> None:
                 window = await scrape_window_fast(page)
 
                 if not window:
+                    await dump_page_debug(page, "no_rows_parsed")
                     logger.warning("No rows parsed. Reloading page...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
                     await page.wait_for_timeout(800)
@@ -449,6 +505,9 @@ async def worker() -> None:
                 await asyncio.sleep(sleep_s)
 
             except asyncio.TimeoutError:
+                # именно тут чаще всего и видно: блок/капча/не та страница
+                if page:
+                    await dump_page_debug(page, "wait_for_selector_timeout")
                 logger.error(
                     "Timeout: scrape_window exceeded %.1fs. Restarting browser session...",
                     SCRAPE_TIMEOUT_SECONDS
