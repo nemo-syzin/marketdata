@@ -11,7 +11,6 @@ from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
@@ -37,19 +36,17 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
-
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# ───────────────────────── PROXY ─────────────────────────
-# Use ONE of:
-#   PROXY_FULL="http://login:pass@host:port" (or socks5://...)
-# or:
-#   PROXY_URL="http://host:port" + PROXY_USERNAME/PROXY_PASSWORD
-PROXY_FULL = (os.getenv("PROXY_FULL", "") or "").strip()
-PROXY_URL = (os.getenv("PROXY_URL", "") or "").strip()
-PROXY_USERNAME = (os.getenv("PROXY_USERNAME", "") or "").strip()
-PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD", "") or "").strip()
+# ───────────────────────── PROXY (HARDCODED: YOUR DATA) ─────────────────────────
+# HTTP proxy:
+PROXY_SERVER = "http://72.56.153.197:50100"
+# SOCKS5 alternative (if you want to try): uncomment next line and comment the http line above
+# PROXY_SERVER = "socks5://72.56.153.197:50101"
+
+PROXY_USERNAME = "nemosyzin"
+PROXY_PASSWORD = "TDbaTDHbTA"
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -79,6 +76,7 @@ def normalize_decimal(text: str) -> Optional[Decimal]:
     except (InvalidOperation, ValueError):
         return None
 
+
 def extract_time(text: str) -> Optional[str]:
     m = TIME_RE.search((text or "").replace("\xa0", " "))
     if not m:
@@ -88,8 +86,10 @@ def extract_time(text: str) -> Optional[str]:
         hh = "0" + hh
     return f"{hh}:{mm}:{ss}"
 
+
 def q8_str(x: Decimal) -> str:
     return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
+
 
 _last_install_ts = 0.0
 
@@ -119,6 +119,7 @@ def _playwright_install() -> None:
     except Exception as e:
         logger.error("Cannot run playwright install: %s", e)
 
+
 def _should_force_install(err: Exception) -> bool:
     s = str(err)
     return (
@@ -128,63 +129,24 @@ def _should_force_install(err: Exception) -> bool:
         or ("ms-playwright" in s and "doesn't exist" in s)
     )
 
-def _build_proxy() -> Tuple[Optional[Dict[str, str]], Optional[str]]:
-    """
-    Returns (playwright_proxy_cfg, httpx_proxy_url).
-    Playwright wants: {"server": "...", "username": "...", "password": "..."}.
-    httpx wants: a single URL like "http://user:pass@host:port".
-    """
-    if PROXY_FULL:
-        u = urlparse(PROXY_FULL)
-        if not u.scheme or not u.hostname or not u.port:
-            raise ValueError("PROXY_FULL must be like http://user:pass@host:port or socks5://user:pass@host:port")
-        server = f"{u.scheme}://{u.hostname}:{u.port}"
-        pw_cfg = {"server": server}
-        if u.username:
-            pw_cfg["username"] = u.username
-        if u.password:
-            pw_cfg["password"] = u.password
-        return pw_cfg, PROXY_FULL
 
-    if not PROXY_URL:
-        return None, None
+@dataclass(frozen=True)
+class TradeKey:
+    source: str
+    symbol: str
+    trade_time: str
+    price: str
+    volume_usdt: str
 
-    u = urlparse(PROXY_URL if "://" in PROXY_URL else f"http://{PROXY_URL}")
-    if not u.scheme or not u.hostname or not u.port:
-        raise ValueError("PROXY_URL must be like http://host:port or socks5://host:port")
 
-    server = f"{u.scheme}://{u.hostname}:{u.port}"
-    pw_cfg = {"server": server}
-    user = PROXY_USERNAME or ""
-    pwd = PROXY_PASSWORD or ""
-    if user:
-        pw_cfg["username"] = user
-    if pwd:
-        pw_cfg["password"] = pwd
-
-    if user and pwd:
-        httpx_proxy = f"{u.scheme}://{user}:{pwd}@{u.hostname}:{u.port}"
-    else:
-        httpx_proxy = f"{u.scheme}://{u.hostname}:{u.port}"
-
-    return pw_cfg, httpx_proxy
-
-async def proxy_sanity_check(httpx_proxy: Optional[str]) -> None:
-    if not httpx_proxy:
-        logger.warning("Proxy is NOT set. Rapira may block foreign IPs on Render.")
-        return
-
-    proxies = {"http://": httpx_proxy, "https://": httpx_proxy}
-    try:
-        async with httpx.AsyncClient(timeout=15.0, proxies=proxies, follow_redirects=True) as client:
-            r1 = await client.get("https://api.ipify.org?format=json")
-            logger.info("Proxy IP check status=%s body=%s", r1.status_code, r1.text.strip())
-
-            r2 = await client.get("https://ipinfo.io/json")
-            body = r2.text.strip().replace("\n", " ")
-            logger.info("Proxy GEO check status=%s body=%s", r2.status_code, body[:500])
-    except Exception as e:
-        logger.warning("Proxy sanity check failed: %s", e)
+def trade_key(t: Dict[str, Any]) -> TradeKey:
+    return TradeKey(
+        source=t["source"],
+        symbol=t["symbol"],
+        trade_time=t["trade_time"],
+        price=t["price"],
+        volume_usdt=t["volume_usdt"],
+    )
 
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
@@ -200,6 +162,7 @@ async def accept_cookies_if_any(page: Page) -> None:
         except Exception:
             pass
 
+
 async def ensure_last_trades_tab(page: Page) -> None:
     try:
         tab = page.locator("text=Последние сделки")
@@ -208,18 +171,6 @@ async def ensure_last_trades_tab(page: Page) -> None:
             await page.wait_for_timeout(200)
     except Exception:
         pass
-
-async def log_page_diagnostics(page: Page, prefix: str) -> None:
-    try:
-        title = await page.title()
-    except Exception:
-        title = "<no-title>"
-    try:
-        body_text = await page.locator("body").inner_text(timeout=2_000)
-        body_text = (body_text or "").strip().replace("\n", " ")
-    except Exception:
-        body_text = "<no-body-text>"
-    logger.warning("%s url=%s title=%s body_snippet=%s", prefix, page.url, title, body_text[:600])
 
 # ───────────────────────── PARSING ─────────────────────────
 
@@ -302,14 +253,11 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+
 async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
     t0 = time.monotonic()
 
-    try:
-        await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
-    except Exception:
-        await log_page_diagnostics(page, "Trades table not found (selector timeout). Likely GEO block / auth wall / captcha.")
-        raise
+    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
 
     payloads = await page.eval_on_selector_all(
         TRADE_ROWS_SELECTOR,
@@ -339,6 +287,7 @@ def _sb_headers() -> Dict[str, str]:
         "Prefer": "resolution=ignore-duplicates,return=minimal",
     }
 
+
 async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
@@ -366,9 +315,13 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
-async def open_browser(pw, proxy_cfg: Optional[Dict[str, str]]) -> Tuple[Browser, BrowserContext, Page]:
-    if proxy_cfg:
-        logger.info("Using proxy for browser: %s", proxy_cfg.get("server"))
+async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
+    proxy_cfg = {
+        "server": PROXY_SERVER,
+        "username": PROXY_USERNAME,
+        "password": PROXY_PASSWORD,
+    }
+    logger.info("Using proxy for browser: %s", PROXY_SERVER)
 
     browser = await pw.chromium.launch(
         headless=True,
@@ -387,26 +340,13 @@ async def open_browser(pw, proxy_cfg: Optional[Dict[str, str]]) -> Tuple[Browser
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
-    resp = await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-    status = None
-    try:
-        status = resp.status if resp else None
-    except Exception:
-        pass
-    logger.info("After goto: final_url=%s status=%s", page.url, status)
-
-    # иногда таблица дорисовывается позже
-    try:
-        await page.wait_for_load_state("networkidle", timeout=20_000)
-    except Exception:
-        pass
-
+    await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
     await ensure_last_trades_tab(page)
     await page.wait_for_timeout(300)
-
     return browser, context, page
+
 
 async def safe_close(browser: Optional[Browser], context: Optional[BrowserContext], page: Optional[Page]) -> None:
     try:
@@ -427,27 +367,7 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
 
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
-@dataclass(frozen=True)
-class TradeKey:
-    source: str
-    symbol: str
-    trade_time: str
-    price: str
-    volume_usdt: str
-
-def trade_key(t: Dict[str, Any]) -> TradeKey:
-    return TradeKey(
-        source=t["source"],
-        symbol=t["symbol"],
-        trade_time=t["trade_time"],
-        price=t["price"],
-        volume_usdt=t["volume_usdt"],
-    )
-
 async def worker() -> None:
-    proxy_cfg, httpx_proxy = _build_proxy()
-    await proxy_sanity_check(httpx_proxy)
-
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
 
@@ -466,11 +386,11 @@ async def worker() -> None:
                 if page is None:
                     logger.info("Starting browser session...")
                     try:
-                        browser, context, page = await open_browser(pw, proxy_cfg)
+                        browser, context, page = await open_browser(pw)
                     except Exception as e:
                         if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
                             _playwright_install()
-                            browser, context, page = await open_browser(pw, proxy_cfg)
+                            browser, context, page = await open_browser(pw)
                         else:
                             raise
                     backoff = 2.0
@@ -484,10 +404,6 @@ async def worker() -> None:
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=20_000)
-                    except Exception:
-                        pass
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
@@ -502,10 +418,6 @@ async def worker() -> None:
                 if not window:
                     logger.warning("No rows parsed. Reloading page...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=20_000)
-                    except Exception:
-                        pass
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
@@ -557,8 +469,10 @@ async def worker() -> None:
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
+
 def main() -> None:
     asyncio.run(worker())
+
 
 if __name__ == "__main__":
     main()
