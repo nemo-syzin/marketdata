@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import httpx
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
@@ -36,23 +37,18 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 ON_CONFLICT = "source,symbol,trade_time,price,volume_usdt"
 
 SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
+
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# ───────────────────────── PROXY ─────────────────────────
-# Render env vars:
-#   PROXY_SERVER   = "http://IP:PORT"   OR "socks5://IP:PORT"
-#   PROXY_USERNAME = "login"
-#   PROXY_PASSWORD = "password"
+# ───────────────────────── PROXY (ADDED) ─────────────────────────
+# Set these env vars in Render:
+#   PROXY_SERVER   -> "http://IP:PORT" or "socks5://IP:PORT"
+#   PROXY_USERNAME -> username
+#   PROXY_PASSWORD -> password
 PROXY_SERVER = (os.getenv("PROXY_SERVER", "") or "").strip()
 PROXY_USERNAME = (os.getenv("PROXY_USERNAME", "") or "").strip()
 PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD", "") or "").strip()
-
-# ───────────────────────── OPTIONAL AUTH (storage_state) ─────────────────────────
-# If Rapira requires authorization to show correct page through proxy,
-# export Playwright storage_state JSON locally and paste it into Render env:
-#   RAPIRA_STORAGE_STATE_JSON = '{"cookies":[...],"origins":[...]}'
-RAPIRA_STORAGE_STATE_JSON = (os.getenv("RAPIRA_STORAGE_STATE_JSON", "") or "").strip()
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -70,6 +66,7 @@ TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
 Q8 = Decimal("0.00000001")
 
 # ───────────────────────── HELPERS ─────────────────────────
+
 
 def normalize_decimal(text: str) -> Optional[Decimal]:
     t = (text or "").strip()
@@ -98,27 +95,35 @@ def q8_str(x: Decimal) -> str:
 
 
 def _proxy_httpx_url() -> Optional[str]:
+    """
+    Returns proxy URL for httpx with credentials embedded, if proxy env vars are set.
+    httpx expects full proxy URL, like: http://user:pass@ip:port
+    """
     if not PROXY_SERVER:
         return None
-    # httpx wants "http://user:pass@host:port" OR socks5 proxy if supported by build.
-    # We only use it for simple IP-check; for socks5 it may fail in some environments.
-    # If PROXY_SERVER already has scheme:
-    server = PROXY_SERVER
-    if PROXY_USERNAME and PROXY_PASSWORD:
-        # inject creds into URL safely for httpx only
-        # e.g. http://host:port -> http://user:pass@host:port
-        m = re.match(r"^(?P<scheme>https?|socks5)://(?P<hostport>.+)$", server)
-        if m:
-            scheme = m.group("scheme")
-            hostport = m.group("hostport")
-            return f"{scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{hostport}"
-    return server
+
+    # PROXY_SERVER already includes scheme + host:port
+    if not PROXY_USERNAME and not PROXY_PASSWORD:
+        return PROXY_SERVER
+
+    u = quote(PROXY_USERNAME, safe="")
+    p = quote(PROXY_PASSWORD, safe="")
+
+    # insert creds into scheme://host:port
+    # example: http://ip:port -> http://user:pass@ip:port
+    m = re.match(r"^(?P<scheme>[^:]+)://(?P<hostport>.+)$", PROXY_SERVER)
+    if not m:
+        return PROXY_SERVER  # fallback
+
+    scheme = m.group("scheme")
+    hostport = m.group("hostport")
+    return f"{scheme}://{u}:{p}@{hostport}"
 
 
 async def log_ip_via_proxy() -> None:
     """
-    Diagnostic: logs outgoing IP as seen by external service.
-    If this shows non-RU IP (or request fails), Rapira may block/redirect.
+    Diagnostic: log outgoing IP via proxy.
+    httpx==0.27.x: proxy is configured on the client, not per-request.
     """
     proxy_url = _proxy_httpx_url()
     if not proxy_url:
@@ -126,18 +131,18 @@ async def log_ip_via_proxy() -> None:
         return
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # ipify is simple; if blocked, you'll see it in logs.
-            r = await client.get(
-                "https://api.ipify.org?format=json",
-                proxies={"http://": proxy_url, "https://": proxy_url},
-            )
-            logger.info("Proxy IP check status=%s body=%s", r.status_code, r.text[:2000])
+        async with httpx.AsyncClient(
+            timeout=15,
+            proxies={"http://": proxy_url, "https://": proxy_url},
+        ) as client:
+            r = await client.get("https://api.ipify.org?format=json")
+            logger.info("Proxy IP check status=%s body=%s", r.status_code, r.text[:500])
     except Exception as e:
         logger.warning("Proxy IP check failed: %s", e)
 
 
 _last_install_ts = 0.0
+
 
 def _playwright_install() -> None:
     global _last_install_ts
@@ -196,8 +201,9 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
 
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
+
 async def accept_cookies_if_any(page: Page) -> None:
-    for label in ["Я согласен", "Принять", "Accept", "OK", "ОК"]:
+    for label in ["Я согласен", "Принять", "Accept"]:
         try:
             btn = page.locator(f"text={label}")
             if await btn.count() > 0:
@@ -213,52 +219,17 @@ async def ensure_last_trades_tab(page: Page) -> None:
     try:
         tab = page.locator("text=Последние сделки")
         if await tab.count() > 0:
-            await tab.first.click(timeout=7_000, no_wait_after=True)
-            await page.wait_for_timeout(250)
+            await tab.first.click(timeout=5_000, no_wait_after=True)
+            await page.wait_for_timeout(200)
     except Exception:
         pass
-
-
-async def dump_page_diagnostics(page: Page, reason: str) -> None:
-    """
-    If table rows never appear, log what page we actually got.
-    This is the key to understanding if it's blocked/redirected/auth-required.
-    """
-    try:
-        url = page.url
-    except Exception:
-        url = "<no url>"
-    try:
-        title = await page.title()
-    except Exception:
-        title = "<no title>"
-
-    snippet = ""
-    try:
-        text = (await page.inner_text("body"))[:3000]
-        snippet = text
-    except Exception:
-        pass
-
-    # quick keyword hints
-    hints = []
-    for kw in ["VPN", "зарубеж", "огранич", "доступ", "авториз", "войд", "login", "captcha", "Cloudflare"]:
-        if kw.lower() in (snippet or "").lower():
-            hints.append(kw)
-
-    logger.error(
-        "DIAG(%s): url=%s title=%s hints=%s body_snippet=%s",
-        reason, url, title, hints, (snippet or "").replace("\n", " ")[:1000]
-    )
 
 # ───────────────────────── PARSING ─────────────────────────
 
-# Primary + fallback selector (site sometimes changes wrapper classes)
-TRADE_ROWS_SELECTORS = [
-    "div.table-responsive.table-orders table.table-row-dashed tbody tr.table-orders-row",
-    "table.table-row-dashed tbody tr.table-orders-row",
-    "tbody tr.table-orders-row",
-]
+TRADE_ROWS_SELECTOR = (
+    "div.table-responsive.table-orders "
+    "table.table-row-dashed tbody tr.table-orders-row"
+)
 
 EVAL_JS = """
 (rows, limit) => rows.slice(0, limit).map(row => {
@@ -269,6 +240,7 @@ EVAL_JS = """
   return { texts, priceHint };
 })
 """
+
 
 def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
@@ -335,35 +307,13 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _wait_for_any_trade_rows(page: Page) -> str:
-    """
-    Wait for any of the known selectors to appear.
-    Returns selector used.
-    """
-    deadline = time.monotonic() + SCRAPE_TIMEOUT_SECONDS
-    last_err = None
-    while time.monotonic() < deadline:
-        for sel in TRADE_ROWS_SELECTORS:
-            try:
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    return sel
-                # try short wait for attachment
-                await page.wait_for_selector(sel, timeout=800, state="attached")
-                return sel
-            except Exception as e:
-                last_err = e
-        await page.wait_for_timeout(250)
-    raise asyncio.TimeoutError(f"Trade rows did not appear. last_err={last_err}")
-
-
 async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
     t0 = time.monotonic()
 
-    selector_used = await _wait_for_any_trade_rows(page)
+    await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
 
     payloads = await page.eval_on_selector_all(
-        selector_used,
+        TRADE_ROWS_SELECTOR,
         EVAL_JS,
         LIMIT,
     )
@@ -381,6 +331,7 @@ async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
     return out
 
 # ───────────────────────── SUPABASE ─────────────────────────
+
 
 def _sb_headers() -> Dict[str, str]:
     return {
@@ -418,45 +369,23 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
-def _build_proxy_cfg() -> Optional[Dict[str, str]]:
-    if not PROXY_SERVER:
-        return None
-    cfg: Dict[str, str] = {"server": PROXY_SERVER}
-    if PROXY_USERNAME:
-        cfg["username"] = PROXY_USERNAME
-    if PROXY_PASSWORD:
-        cfg["password"] = PROXY_PASSWORD
-    return cfg
-
-
-def _write_storage_state_tmp() -> Optional[str]:
-    if not RAPIRA_STORAGE_STATE_JSON:
-        return None
-    try:
-        data = json.loads(RAPIRA_STORAGE_STATE_JSON)
-        path = "/tmp/rapira_storage_state.json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        return path
-    except Exception as e:
-        logger.error("Invalid RAPIRA_STORAGE_STATE_JSON: %s", e)
-        return None
-
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
-    proxy_cfg = _build_proxy_cfg()
-    if proxy_cfg:
-        logger.info("Using proxy for browser: %s", proxy_cfg.get("server"))
+    proxy_cfg = None
+    if PROXY_SERVER:
+        proxy_cfg = {"server": PROXY_SERVER}
+        if PROXY_USERNAME:
+            proxy_cfg["username"] = PROXY_USERNAME
+        if PROXY_PASSWORD:
+            proxy_cfg["password"] = PROXY_PASSWORD
+        logger.info("Using proxy for browser: %s", PROXY_SERVER)
 
     browser = await pw.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
         proxy=proxy_cfg,
     )
-
-    storage_state_path = _write_storage_state_tmp()
-
-    context_kwargs: Dict[str, Any] = dict(
+    context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
         locale="ru-RU",
         timezone_id="Europe/Moscow",
@@ -465,23 +394,16 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
-    if storage_state_path:
-        context_kwargs["storage_state"] = storage_state_path
-        logger.info("Using storage_state from %s", storage_state_path)
-
-    context = await browser.new_context(**context_kwargs)
-
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+    logger.info("After goto: final_url=%s", page.url)
+
     await page.wait_for_timeout(800)
     await accept_cookies_if_any(page)
     await ensure_last_trades_tab(page)
     await page.wait_for_timeout(300)
-
-    # quick sanity log: where did we end up?
-    logger.info("After goto: final_url=%s", page.url)
     return browser, context, page
 
 
@@ -504,6 +426,7 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
 
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
+
 async def worker() -> None:
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
@@ -512,7 +435,7 @@ async def worker() -> None:
     last_heartbeat = time.monotonic()
     last_reload = time.monotonic()
     last_click_tab = 0.0
-    last_ip_check = 0.0
+    did_proxy_ip_check = False
 
     async with async_playwright() as pw:
         browser: Optional[Browser] = None
@@ -521,10 +444,9 @@ async def worker() -> None:
 
         while True:
             try:
-                # occasional proxy IP check (diagnostic)
-                if time.monotonic() - last_ip_check > 600:
+                if not did_proxy_ip_check:
                     await log_ip_via_proxy()
-                    last_ip_check = time.monotonic()
+                    did_proxy_ip_check = True
 
                 if page is None:
                     logger.info("Starting browser session...")
@@ -541,12 +463,13 @@ async def worker() -> None:
                     last_heartbeat = time.monotonic()
 
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                    logger.info("Heartbeat: alive. seen=%d url=%s", len(seen), getattr(page, "url", "?"))
+                    logger.info("Heartbeat: alive. seen=%d", len(seen))
                     last_heartbeat = time.monotonic()
 
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     logger.warning("Maintenance reload...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    logger.info("After reload: final_url=%s", page.url)
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
@@ -561,6 +484,7 @@ async def worker() -> None:
                 if not window:
                     logger.warning("No rows parsed. Reloading page...")
                     await page.goto(RAPIRA_URL, wait_until="domcontentloaded", timeout=60_000)
+                    logger.info("After reload(no rows): final_url=%s", page.url)
                     await page.wait_for_timeout(800)
                     await accept_cookies_if_any(page)
                     await ensure_last_trades_tab(page)
@@ -591,13 +515,9 @@ async def worker() -> None:
                 sleep_s = max(0.35, POLL_SECONDS + random.uniform(-0.15, 0.15))
                 await asyncio.sleep(sleep_s)
 
-            except asyncio.TimeoutError as te:
-                # main diagnostic point
-                if page is not None:
-                    await dump_page_diagnostics(page, reason=f"timeout:{te}")
-
+            except asyncio.TimeoutError:
                 logger.error(
-                    "Timeout: trade table didn't appear within %.1fs. Restarting browser session...",
+                    "Timeout: scrape_window exceeded %.1fs. Restarting browser session...",
                     SCRAPE_TIMEOUT_SECONDS
                 )
                 await safe_close(browser, context, page)
