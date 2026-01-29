@@ -42,15 +42,16 @@ SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# ──────────────── PROXY (ДОБАВЛЕНО) ────────────────
-# Пример:
-# PROXY_SERVER=http://72.56.153.197:50100
-# PROXY_USERNAME=nemosyzin
-# PROXY_PASSWORD=...
-PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip()
-PROXY_USERNAME = os.getenv("PROXY_USERNAME", "").strip()
-PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "").strip()
-# ───────────────────────────────────────────────────
+# ───────────────────────── PROXY (ADDED) ─────────────────────────
+# Set these env vars in Render:
+#   PROXY_SERVER   -> e.g. "http://72.56.153.197:50100" or "socks5://72.56.153.197:50101"
+#   PROXY_USERNAME -> e.g. "nemosyzin"
+#   PROXY_PASSWORD -> e.g. "TDbaTDHbTA"
+#
+# IMPORTANT: do NOT include credentials in the URL for Playwright; pass separately.
+PROXY_SERVER = (os.getenv("PROXY_SERVER", "") or "").strip()
+PROXY_USERNAME = (os.getenv("PROXY_USERNAME", "") or "").strip()
+PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD", "") or "").strip()
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -155,6 +156,7 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
+    # no_wait_after=True снижает шанс “внутренних ожиданий” при клике, если сайт дергает навигацию/оверлей
     for label in ["Я согласен", "Принять", "Accept"]:
         try:
             btn = page.locator(f"text={label}")
@@ -260,6 +262,7 @@ def parse_row_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 async def scrape_window_fast(page: Page) -> List[Dict[str, Any]]:
     t0 = time.monotonic()
+
     await page.wait_for_selector(TRADE_ROWS_SELECTOR, timeout=int(SCRAPE_TIMEOUT_SECONDS * 1000))
 
     payloads = await page.eval_on_selector_all(
@@ -319,22 +322,21 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
-    # ──────────────── PROXY (ДОБАВЛЕНО) ────────────────
-    launch_kwargs = {
-        "headless": True,
-        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-    }
+    # ─── PROXY (ADDED) ───
+    proxy_cfg = None
     if PROXY_SERVER:
-        launch_kwargs["proxy"] = {
-            "server": PROXY_SERVER,
-            "username": PROXY_USERNAME or None,
-            "password": PROXY_PASSWORD or None,
-        }
+        proxy_cfg = {"server": PROXY_SERVER}
+        if PROXY_USERNAME:
+            proxy_cfg["username"] = PROXY_USERNAME
+        if PROXY_PASSWORD:
+            proxy_cfg["password"] = PROXY_PASSWORD
         logger.info("Using proxy for browser: %s", PROXY_SERVER)
-    # ───────────────────────────────────────────────────
 
-    browser = await pw.chromium.launch(**launch_kwargs)
-
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+        proxy=proxy_cfg,  # ← ONLY ADDITION THAT AFFECTS NETWORK
+    )
     context = await browser.new_context(
         viewport={"width": 1440, "height": 810},
         locale="ru-RU",
